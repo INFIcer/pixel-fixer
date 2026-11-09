@@ -6,31 +6,31 @@ export const RESAMPLE_METHODS = Object.freeze([
     id: 'nearest',
     name: '最近邻',
     short: '保留原始色块，像素画首选',
-    description: '直接取最近源像素，不产生新颜色。适合已经对齐的像素画。',
+    description: '直接取最近的源像素，不产生新颜色。适合已经对齐的像素画。',
   },
   {
     id: 'bilinear',
     name: '双线性',
     short: '柔和，会生成过渡色',
-    description: '2×2 邻域线性插值；缩放时略微软化，可能产生大量中间色。',
+    description: '按相邻像素线性混合；缩放后边缘略软，容易产生过渡色。',
   },
   {
     id: 'bicubic',
     name: '双三次',
     short: '更平滑，边缘更自然',
-    description: 'Catmull-Rom 双三次卷积；比双线性平滑，但更容易产生振铃和过渡色。',
+    description: '在双线性基础上进一步平滑；边缘更柔和，也更容易出现过渡色和轻微光晕。',
   },
   {
     id: 'lanczos3',
     name: 'Lanczos3',
     short: '锐利，细节保留好',
-    description: 'Lanczos 3 瓣窗口 sinc 插值；缩小时较锐利，边缘可能出现轻微振铃。',
+    description: '细节保留更锐利；缩小后边缘可能出现轻微光晕。',
   },
   {
     id: 'area',
     name: '区域平均',
     short: '按覆盖面积取平均，适合缩小',
-    description: '按源像素覆盖输出像素的面积加权平均；缩小时抗锯齿最稳定，放大时接近平滑方波。',
+    description: '按覆盖面积取平均；缩小最稳定，放大后边缘会偏软。',
   },
 ]);
 
@@ -65,7 +65,7 @@ function validate(image, crop, width, height, method) {
   }
   if (!crop || !Number.isFinite(crop.x) || !Number.isFinite(crop.y)
     || !(crop.width > 0) || !(crop.height > 0)) {
-    throw new TypeError('裁剪区域无效');
+    throw new TypeError('裁切区域无效');
   }
   if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
     throw new TypeError('输出尺寸无效');

@@ -87,7 +87,7 @@ export function buildExportMeta(baseName, transform, factor, colorCount) {
   const pixels = outputWidth * outputHeight;
   return {
     filename: buildExportFilename(baseName, outputWidth, outputHeight, scale),
-    stats: `${outputWidth}×${outputHeight} · ${pixels} 像素 · ${colorText} 色 · 导出 ${outputWidth * scale}×${outputHeight * scale}`,
+    stats: `${outputWidth}×${outputHeight} · ${pixels} 像素 · ${colorText} 色 · 导出尺寸 ${outputWidth * scale}×${outputHeight * scale}`,
   };
 }
 

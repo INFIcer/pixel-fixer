@@ -127,7 +127,7 @@ function timelineValue(input, value) {
 function setBusy(busy) {
   el.topDot.classList.toggle('is-busy', Boolean(busy));
   el.topDot.classList.toggle('is-live', !busy && Boolean(state.source));
-  if (busy) el.statusText.textContent = '正在重建预览…';
+  if (busy) el.statusText.textContent = '正在更新预览…';
 }
 
 function setStatus(message) {
@@ -428,7 +428,7 @@ function bindEvents() {
 
   window.addEventListener('unhandledrejection', (event) => {
     console.error(event.reason);
-    showToast(`发生错误：${event.reason?.message || event.reason}`, 'error', 5000);
+    showToast('操作未完成，请重试。', 'error', 5000);
   });
 }
 
@@ -565,7 +565,7 @@ async function importAnyFile(file) {
     showToast(`已导入 ${state.source.name}`, 'success');
   } catch (error) {
     console.error(error);
-    showToast(`导入失败：${error.message}`, 'error', 5000);
+    showToast(`导入失败：${error.message}。请换一张图片重试。`, 'error', 5000);
     setStatus('导入失败');
     setBusy(false);
   }
@@ -638,7 +638,7 @@ async function openProjectFile(file) {
     showToast(`工程已加载：${file.name}`, 'success');
   } catch (error) {
     console.error(error);
-    showToast(error.message || '工程加载失败', 'error', 5500);
+    showToast(error.message || '工程加载失败，请确认文件是否完整。', 'error', 5500);
     setStatus('工程加载失败');
     setBusy(false);
   }
@@ -707,7 +707,7 @@ async function loadProjectText(text, options = {}) {
   const dimensionMismatch = imageData.width !== project.sourceWidth || imageData.height !== project.sourceHeight;
   if (dimensionMismatch) {
     showToast(
-      `注意：工程记录源图 ${project.sourceWidth}×${project.sourceHeight}，实际解码为 ${imageData.width}×${imageData.height}。`,
+      `注意：工程记录的源图尺寸为 ${project.sourceWidth}×${project.sourceHeight}，实际读取为 ${imageData.width}×${imageData.height}，已按实际尺寸载入。`,
       'error',
       5500,
     );
@@ -718,7 +718,7 @@ async function loadProjectText(text, options = {}) {
     const paletteMismatch = currentPalette.length !== project.palette.length
       || currentPalette.some((hex, index) => hex !== project.palette[index]);
     if (paletteMismatch && !dimensionMismatch) {
-      showToast('自动调色板已按当前算法重建；仍存在的旧改色映射会继续生效。', 'error', 5000);
+      showToast('自动配色已按当前设置重新生成；原有的改色仍会保留。', 'error', 5000);
     }
   }
 
@@ -1159,15 +1159,15 @@ function rebuildPipeline() {
     el.topStatus.textContent = `${state.transform.outputWidth}×${state.transform.outputHeight} · ${finalPalette.length} 色`;
     setStatus('预览已更新');
     if (cache.quantized.approximate) {
-      el.approxState.title = '颜色数量过多，阈值/目标色数模式使用 4bit/通道预聚合以保证响应速度';
+      el.approxState.title = '颜色数量过多，本次结果做了近似处理以保持操作流畅';
     } else {
       el.approxState.removeAttribute('title');
     }
   } catch (error) {
     console.error(error);
     setBusy(false);
-    setStatus('计算失败');
-    showToast(`预览计算失败：${error.message}`, 'error', 5500);
+    setStatus('更新失败');
+    showToast(`预览更新失败：${error.message}。请重试。`, 'error', 5500);
   }
 }
 
@@ -1196,7 +1196,7 @@ function drawResultScaled() {
   context.imageSmoothingEnabled = false;
   context.clearRect(0, 0, width, height);
   context.drawImage(outputCanvas, 0, 0, width, height);
-  el.resultTip.textContent = `${zoom}× 最近邻显示 · 实际 ${outputCanvas.width}×${outputCanvas.height}`;
+  el.resultTip.textContent = `${zoom}× 最近邻放大 · 实际 ${outputCanvas.width}×${outputCanvas.height}`;
 }
 
 function centerResultScroll() {
@@ -1254,7 +1254,7 @@ function undoRecolor() {
   markDirty();
   refreshRecolorOnly();
   updateActionAvailability();
-  showToast('已撤销上一次调色盘修改');
+  showToast('已撤销上一次改色');
 }
 
 function resetRecolor() {
@@ -1264,7 +1264,7 @@ function resetRecolor() {
   markDirty();
   refreshRecolorOnly();
   updateActionAvailability();
-  showToast('已还原为自动聚类颜色');
+  showToast('已还原为自动配色');
 }
 
 function openPalettePicker(index) {
@@ -1281,13 +1281,13 @@ function openPalettePicker(index) {
 
 function importHexFile(file) {
   if (!state.source || !finalPalette.length) {
-    showToast('请先导入图片并生成调色盘', 'error');
+    showToast('请先导入图片，生成调色盘后再导入 HEX。', 'error');
     return;
   }
   file.text().then((text) => {
     const colors = parseHexPalette(text);
     if (!colors.length) {
-      showToast('文件中没有找到有效 HEX 颜色', 'error');
+      showToast('文件中没有有效的 HEX 颜色，请检查文件内容。', 'error');
       return;
     }
     pushHistory(state.recolorMap);
@@ -1300,10 +1300,10 @@ function importHexFile(file) {
     }
     markDirty();
     refreshRecolorOnly();
-    showToast(`已导入 ${colors.length} 个颜色，映射到前 ${count} 个自动色。`, 'success');
+    showToast(`已导入 ${colors.length} 个颜色，按顺序替换前 ${count} 个自动配色。`, 'success');
   }).catch((error) => {
     console.error(error);
-    showToast(`读取调色板失败：${error.message}`, 'error');
+    showToast(`读取调色盘失败：${error.message}。请检查文件内容。`, 'error');
   });
 }
 
@@ -1337,7 +1337,7 @@ function updateSourceInfo(crop = currentCrop()) {
   el.srcZoom.textContent = `缩放 ${formatZoomPercent(t.scale)}`;
   el.srcOffset.textContent = `偏移 ${t.offsetX.toFixed(1)}, ${t.offsetY.toFixed(1)}`;
   if (crop) {
-    el.srcCrop.textContent = `裁切 ${crop.width.toFixed(1)} × ${crop.height.toFixed(1)} @ (${crop.x.toFixed(1)}, ${crop.y.toFixed(1)})`;
+    el.srcCrop.textContent = `裁切 ${crop.width.toFixed(1)} × ${crop.height.toFixed(1)}`;
   }
 }
 
@@ -1354,7 +1354,7 @@ function updateOutputInfo() {
   el.resultColors.textContent = `${finalPalette.length} 色`;
   el.colorCount.textContent = String(finalPalette.length);
   if (cache.quantized) {
-    el.approxState.textContent = cache.quantized.approximate ? '预聚合' : '精确';
+    el.approxState.textContent = cache.quantized.approximate ? '近似' : '精确';
   } else {
     el.approxState.textContent = '精确';
   }
@@ -1362,14 +1362,14 @@ function updateOutputInfo() {
   if (finalPalette.length) {
     const changed = finalPalette.filter((entry) => entry.changed).length;
     if (cache.quantized?.approximate) {
-      el.paletteHint.textContent = '近似预聚合';
+      el.paletteHint.textContent = '近似';
     } else if (changed) {
       el.paletteHint.textContent = `已改色 ${changed}`;
     } else {
-      el.paletteHint.textContent = state.colorMode === 'target' ? `目标 ${state.maxColors} 色` : '自动聚类';
+      el.paletteHint.textContent = state.colorMode === 'target' ? `目标 ${state.maxColors} 色` : '自动配色';
     }
   } else {
-    el.paletteHint.textContent = '自动聚类';
+    el.paletteHint.textContent = '自动配色';
   }
 }
 
@@ -1383,7 +1383,7 @@ function updateExportMeta() {
 
 function updateTimingText() {
   const { resample, quantize, compose, total } = lastTimings;
-  el.timingText.textContent = `重采样 ${resample.toFixed(1)}ms · 量化 ${quantize.toFixed(1)}ms · 合成 ${compose.toFixed(1)}ms · 总计 ${total.toFixed(1)}ms`;
+  el.timingText.textContent = `重采样 ${resample.toFixed(1)} 毫秒 · 色阶简化 ${quantize.toFixed(1)} 毫秒 · 合成 ${compose.toFixed(1)} 毫秒 · 总计 ${total.toFixed(1)} 毫秒`;
 }
 
 function updateEmptyStates() {
@@ -1578,8 +1578,8 @@ async function exportPng() {
 
   if (width * height > LARGE_EXPORT_PIXELS) {
     const okay = window.confirm(
-      `即将导出 ${width}×${height}（${(width * height / 1_000_000).toFixed(1)} 百万像素）的 PNG，`
-      + '浏览器需要较多内存，可能失败。继续吗？',
+      `即将导出 ${width}×${height}（约 ${(width * height / 1_000_000).toFixed(1)} 百万像素）的文件，`
+      + '浏览器可能因内存不足而失败。是否继续？',
     );
     if (!okay) return;
   }
@@ -1591,7 +1591,7 @@ async function exportPng() {
     exportCanvas.width = width;
     exportCanvas.height = height;
     const context = exportCanvas.getContext('2d');
-    if (!context) throw new Error('无法创建导出画布');
+    if (!context) throw new Error('浏览器无法创建导出图像，请减小输出尺寸后重试');
     context.imageSmoothingEnabled = false;
     context.drawImage(outputCanvas, 0, 0, width, height);
     let blob;
@@ -1607,7 +1607,7 @@ async function exportPng() {
     showToast(`已导出 ${filename} · ${formatBytes(blob.size)}`, 'success', 4200);
   } catch (error) {
     console.error(error);
-    showToast(`导出失败：${error.message}`, 'error', 5000);
+    showToast(`导出失败：${error.message}。请重试。`, 'error', 5000);
   } finally {
     setBusy(false);
     setStatus('预览已更新');
@@ -1639,14 +1639,14 @@ async function exportPalettePng() {
     showToast(`已导出调色盘 ${filename}`, 'success');
   } catch (error) {
     console.error(error);
-    showToast(`调色盘导出失败：${error.message}`, 'error', 5000);
+    showToast(`调色盘导出失败：${error.message}。请重试。`, 'error', 5000);
   }
 }
 
 /* ---------- 工程文件 ---------- */
 
 function makeProjectText() {
-  if (!state.source || !cache.quantized) throw new Error('当前没有可保存的工作内容');
+  if (!state.source || !cache.quantized) throw new Error('当前没有可保存的内容，请先导入图片');
   const project = createProject({
     sourceImage: state.source.dataUrl,
     sourceWidth: state.source.width,
@@ -1682,8 +1682,8 @@ function saveProject() {
     const bytes = projectSizeBytes(text);
     if (bytes > LARGE_PROJECT_BYTES) {
       const okay = window.confirm(
-        `工程文件约 ${formatBytes(bytes)}，其中大部分是源图 base64。\n`
-        + '文件较大，继续保存吗？',
+        `工程文件约 ${formatBytes(bytes)}，体积主要来自内嵌的源图。\n`
+        + '文件较大，是否继续保存？',
       );
       if (!okay) return;
     }
@@ -1697,7 +1697,7 @@ function saveProject() {
     showToast(`工程已保存：${filename} · ${formatBytes(bytes)}`, 'success', 4200);
   } catch (error) {
     console.error(error);
-    showToast(`保存工程失败：${error.message}`, 'error', 5000);
+    showToast(`保存工程失败：${error.message}。请重试。`, 'error', 5000);
   }
 }
 
@@ -1737,7 +1737,7 @@ function onDrop(event) {
     importAnyFile(image);
     return;
   }
-  showToast('拖入的文件既不是图片也不是工程文件', 'error');
+  showToast('拖入的文件不是图片，也不是工程文件，请重新选择。', 'error');
 }
 
 function onPaste(event) {

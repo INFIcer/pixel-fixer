@@ -7,7 +7,7 @@ import { isValidResample } from './resample.js';
 export const PROJECT_VERSION = 1;
 
 function fail(message) {
-  throw new Error(`工程文件无效：${message}`);
+  throw new Error(`无法打开工程：${message}`);
 }
 
 function nowIso(value) {
@@ -29,9 +29,9 @@ function integer(value, fallback, min, max) {
   return Math.max(min, Math.min(max, Math.round(finiteNumber(value, fallback, min, max))));
 }
 
-function normalizePalette(value, fieldName) {
+function normalizePalette(value) {
   if (value == null) return [];
-  if (!Array.isArray(value)) fail(`${fieldName} 必须是数组`);
+  if (!Array.isArray(value)) fail('调色板数据格式不正确，请重新生成调色盘。');
   const seen = new Set();
   const result = [];
   for (const item of value) {
@@ -48,7 +48,7 @@ function normalizePalette(value, fieldName) {
 
 function normalizeRecolorMap(value) {
   if (value == null) return {};
-  if (typeof value !== 'object' || Array.isArray(value)) fail('recolorMap 必须是对象');
+  if (typeof value !== 'object' || Array.isArray(value)) fail('改色记录格式不正确，请重新生成调色盘。');
   const result = {};
   for (const [source, target] of Object.entries(value)) {
     const sourceHex = normalizeHex(source);
@@ -87,19 +87,19 @@ function normalizeUi(value, fallbackScale = 1) {
  * @param {object} raw
  */
 export function normalizeProject(raw) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('根节点必须是对象');
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) fail('文件内容不完整，请确认选择的是本工具保存的工程文件。');
   if (Number(raw.version) !== PROJECT_VERSION) {
-    fail(`不支持的版本 ${raw.version ?? '缺失'}（当前支持 ${PROJECT_VERSION}）`);
+    fail(`版本 ${raw.version ?? '缺失'} 不受支持，请用当前版本重新保存工程。`);
   }
 
   const sourceImage = raw.sourceImage;
   if (typeof sourceImage !== 'string' || !/^data:image\/[a-z0-9.+-]+[,;]/i.test(sourceImage)) {
-    fail('sourceImage 必须是图片 dataURL');
+    fail('工程中缺少可用的源图，请重新导入图片后再保存。');
   }
 
   const sourceWidth = integer(raw.sourceWidth, 0, 0, 100000);
   const sourceHeight = integer(raw.sourceHeight, 0, 0, 100000);
-  if (sourceWidth < 1 || sourceHeight < 1) fail('源图宽高必须为正整数');
+  if (sourceWidth < 1 || sourceHeight < 1) fail('工程中的源图尺寸无效。');
 
   const transformRaw = raw.transform && typeof raw.transform === 'object' ? raw.transform : {};
   const transform = {
@@ -131,9 +131,9 @@ export function normalizeProject(raw) {
     threshold: finiteNumber(raw.threshold, 0, 0, 100),
     maxColors: integer(raw.maxColors, 16, 1, 256),
     dither: Boolean(raw.dither),
-    palette: normalizePalette(raw.palette, 'palette'),
+    palette: normalizePalette(raw.palette),
     recolorMap: normalizeRecolorMap(raw.recolorMap),
-    manualPalette: normalizePalette(raw.manualPalette, 'manualPalette'),
+    manualPalette: normalizePalette(raw.manualPalette),
     ui: normalizeUi(raw.ui, transform.scale),
   };
 }
@@ -174,12 +174,12 @@ export function serializeProject(project) {
 
 /** 解析并校验工程 JSON 字符串。 */
 export function parseProject(text) {
-  if (typeof text !== 'string' || !text.trim()) fail('文件为空');
+  if (typeof text !== 'string' || !text.trim()) fail('文件是空的，请选择有效的工程文件。');
   let raw;
   try {
     raw = JSON.parse(text);
-  } catch (error) {
-    fail(`JSON 解析失败（${error.message}）`);
+  } catch {
+    fail('文件内容无法识别，请确认选择的是 .pixfix.json 工程文件。');
   }
   return normalizeProject(raw);
 }

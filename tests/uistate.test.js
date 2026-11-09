@@ -73,7 +73,7 @@ test('锁定宽高比：非法输入回退且比例无效时原样返回', () =>
 test('导出信息包含文件名、像素数与倍数尺寸', () => {
   const meta = buildExportMeta('森林 小屋.png', { outputWidth: 64, outputHeight: 48 }, 4, 12);
   assert.equal(meta.filename, '森林 小屋_fixed_64x48@4x.png');
-  assert.equal(meta.stats, '64×48 · 3072 像素 · 12 色 · 导出 256×192');
+  assert.equal(meta.stats, '64×48 · 3072 像素 · 12 色 · 导出尺寸 256×192');
   const single = buildExportMeta('a.png', { outputWidth: 32, outputHeight: 32 }, 1, 0);
   assert.equal(single.filename, 'a_fixed_32x32.png');
 });

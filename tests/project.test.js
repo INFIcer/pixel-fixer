@@ -112,15 +112,15 @@ test('非法版本与损坏 JSON 给出中文错误', () => {
   const project = example();
   const badVersion = JSON.parse(serializeProject(project));
   badVersion.version = 999;
-  assert.throws(() => parseProject(JSON.stringify(badVersion)), /不支持的版本/);
-  assert.throws(() => parseProject('{oops'), /JSON 解析失败/);
-  assert.throws(() => parseProject(''), /文件为空/);
+  assert.throws(() => parseProject(JSON.stringify(badVersion)), /不受支持/);
+  assert.throws(() => parseProject('{oops'), /无法识别/);
+  assert.throws(() => parseProject(''), /文件是空的/);
 });
 
 test('缺失或非法 sourceImage 会被拒绝', () => {
   const project = JSON.parse(serializeProject(example()));
   project.sourceImage = 'not-a-data-url';
-  assert.throws(() => parseProject(JSON.stringify(project)), /sourceImage/);
+  assert.throws(() => parseProject(JSON.stringify(project)), /源图/);
 });
 
 test('尺寸与阈值被限制到合法范围', () => {

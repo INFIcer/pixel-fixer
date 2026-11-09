@@ -42,7 +42,7 @@
     </header>
 
     <main class="workspace">
-      <aside class="panel controls-panel" aria-label="参数面板">
+      <aside class="panel controls-panel" aria-label="调整面板">
         <div class="panel-scroll">
           <section class="control-section">
             <div class="section-heading">
@@ -74,21 +74,21 @@
               <div class="field-header">
                 <span>源图缩放</span>
                 <span class="zoom-stepper" role="group" aria-label="源图缩放微调">
-                  <button type="button" id="btnZoomOut" class="zoom-step" aria-label="缩小（按住 Shift 精调）" title="缩小 2%（按住 Shift 为 0.5%）">−</button>
+                  <button type="button" id="btnZoomOut" class="zoom-step" aria-label="缩小（按住 Shift 细调）" title="缩小一档（按住 Shift 细调）">−</button>
                   <input id="zoomInput" class="zoom-input" type="text" inputmode="decimal" aria-label="源图缩放百分比" value="100%" spellcheck="false" autocomplete="off">
-                  <button type="button" id="btnZoomIn" class="zoom-step" aria-label="放大（按住 Shift 精调）" title="放大 2%（按住 Shift 为 0.5%）">+</button>
+                  <button type="button" id="btnZoomIn" class="zoom-step" aria-label="放大（按住 Shift 细调）" title="放大一档（按住 Shift 细调）">+</button>
                 </span>
               </div>
-              <input id="zoomRange" class="range" type="range" min="0" max="1000" step="1" value="454" aria-label="源图缩放（对数刻度 10%~1600%）">
-              <div class="range-scale"><span>10%</span><span class="range-scale-mid">对数刻度</span><span>1600%</span></div>
+              <input id="zoomRange" class="range" type="range" min="0" max="1000" step="1" value="454" aria-label="源图缩放比例（10% 至 1600%）">
+              <div class="range-scale"><span>10%</span><span class="range-scale-mid">拖动调节</span><span>1600%</span></div>
             </div>
 
             <div class="inline-actions zoom-actions">
-              <button type="button" id="btnZoomFit" class="btn btn-small" title="让整张源图落入预览窗口（F）">适应窗口</button>
-              <button type="button" id="btnZoomActual" class="btn btn-small" title="缩放回 100%（0）">1:1</button>
-              <button type="button" id="btnResetCrop" class="btn btn-small" title="缩放 100% 并居中">重置裁切</button>
+              <button type="button" id="btnZoomFit" class="btn btn-small" title="使整张源图适配预览窗口（F）">适应窗口</button>
+              <button type="button" id="btnZoomActual" class="btn btn-small" title="恢复为 100%（0）">1:1</button>
+              <button type="button" id="btnResetCrop" class="btn btn-small" title="恢复 100% 并居中">重置裁切</button>
             </div>
-            <p class="hint zoom-hint">滚轮缩放 · Shift 精调 · 拖拽平移</p>
+            <p class="hint zoom-hint">拖拽平移 · 滚轮缩放 · 按住 Shift 细调</p>
           </section>
 
           <section class="control-section">
@@ -126,8 +126,8 @@
                 <output id="thresholdValue" class="value-chip" for="thresholdRange">0</output>
               </div>
               <input id="thresholdRange" class="range" type="range" min="0" max="100" step="1" value="0">
-              <div class="range-scale"><span>0 · 不合并</span><span>100 · 最激进</span></div>
-              <p class="hint hint-block">CIELAB ΔE 距离小于阈值的颜色被合并；颜色数随阈值单调不增。</p>
+              <div class="range-scale"><span>0 · 不合并</span><span>100 · 合并最多</span></div>
+              <p class="hint hint-block">差异小于阈值的颜色会被合并。阈值越高，合并越多，最终颜色越少。</p>
             </div>
 
             <div id="targetGroup" class="mode-group is-hidden">
@@ -135,23 +135,23 @@
                 <span>目标颜色数</span>
                 <span class="number-wrap number-wrap-short"><input id="targetColors" type="number" min="2" max="256" step="1" value="16" inputmode="numeric"><em>色</em></span>
               </label>
-              <p class="hint hint-block">在 CIELAB 空间执行带权 k-means++，自动寻找合适的 N 色。</p>
+              <p class="hint hint-block">自动把画面归并为指定数量的颜色，用于统一整幅画的色调。</p>
             </div>
 
             <label class="check-line">
               <input id="ditherToggle" type="checkbox">
               <span>Floyd–Steinberg 抖动</span>
-              <small>默认关</small>
+              <small>默认关闭</small>
             </label>
 
             <div class="mini-stats">
               <div><strong id="colorCount">0</strong><span>最终颜色</span></div>
-              <div><strong id="approxState">精确</strong><span>量化模式</span></div>
+              <div><strong id="approxState">精确</strong><span>颜色精度</span></div>
             </div>
 
             <div class="inline-actions">
               <button type="button" id="btnUndoRecolor" class="btn btn-small" disabled>撤销改色</button>
-              <button type="button" id="btnResetRecolor" class="btn btn-small" disabled>还原自动色</button>
+              <button type="button" id="btnResetRecolor" class="btn btn-small" disabled>还原自动配色</button>
             </div>
           </section>
 
@@ -182,7 +182,7 @@
               <button type="button" id="btnExportPng" class="btn btn-accent">导出 PNG</button>
               <button type="button" id="btnExportPalette" class="btn">调色盘 PNG</button>
             </div>
-            <p class="hint hint-block">PNG 使用最近邻放大，像素边缘保持锐利。工程文件请用顶部“保存工程”。</p>
+            <p class="hint hint-block">导出时按最近邻放大，像素边缘保持锐利。需要保留工程请使用顶部“保存工程”。</p>
           </section>
         </div>
       </aside>
@@ -196,7 +196,7 @@
             </div>
             <div class="preview-heading-right">
               <span class="tag" id="srcInfoBadge">未导入</span>
-              <span class="preview-tip">青色框 = 输出裁切范围</span>
+              <span class="preview-tip">青色框内为导出范围</span>
             </div>
           </header>
           <div class="canvas-stage" id="sourceWrap">
@@ -205,14 +205,14 @@
               <div class="empty-art" aria-hidden="true">
                 <span></span><span></span><span></span><span></span>
               </div>
-              <h3>拖入一张图片开始</h3>
-              <p>也可以按 <kbd>Ctrl</kbd> + <kbd>V</kbd> 粘贴剪贴板图片</p>
+              <h3>将图片拖到这里开始</h3>
+              <p>也可以按 <kbd>Ctrl</kbd> + <kbd>V</kbd> 粘贴剪贴板中的图片</p>
               <div class="empty-actions">
                 <button type="button" class="btn btn-small btn-accent" id="btnEmptyImport">选择图片</button>
                 <button type="button" class="btn btn-small" id="btnEmptyProject">打开工程</button>
               </div>
             </div>
-            <div class="canvas-hud">拖拽平移 · 滚轮缩放 · Shift 精调 · 框内为导出范围</div>
+            <div class="canvas-hud">拖拽平移 · 滚轮缩放 · 按住 Shift 细调</div>
           </div>
           <footer class="preview-footer">
             <span id="srcDims">源图 —</span>
@@ -269,8 +269,8 @@
           <button type="button" id="btnExportHex" class="btn btn-small">导出 HEX</button>
         </div>
         <div class="palette-legend">
-          <span>点击色块改色 · 全图重映射</span>
-          <span id="paletteHint">自动聚类</span>
+          <span>点击色块改色 · 改动应用到整张图</span>
+          <span id="paletteHint">自动配色</span>
         </div>
         <div class="palette-list" id="paletteList"></div>
         <div class="palette-empty" id="paletteEmpty">
@@ -288,7 +288,7 @@
     <footer class="statusbar">
       <span class="status-main"><span class="status-dot"></span><span id="statusText">就绪，等待导入</span></span>
       <span class="status-separator">/</span>
-      <span id="timingText">尚无计算</span>
+      <span id="timingText">暂无耗时</span>
       <span class="status-spacer"></span>
       <span id="projectState">未命名工作</span>
       <span class="status-separator">/</span>
@@ -298,8 +298,8 @@
 
   <div class="drop-overlay" id="dropOverlay">
     <div class="drop-card">
-      <strong>松手导入</strong>
-      <span>支持图片，或 .pixfix.json 工程文件</span>
+      <strong>松开即可导入</strong>
+      <span>支持图片与 .pixfix.json 工程文件</span>
     </div>
   </div>
 
@@ -328,7 +328,7 @@
       const script = document.createElement('script');
       script.src = './src/standalone.js';
       script.onerror = () => {
-        document.getElementById('statusText').textContent = '启动失败：找不到 src/standalone.js';
+        document.getElementById('statusText').textContent = '启动失败：请通过本地服务器打开页面';
         document.getElementById('topStatus').textContent = '启动失败';
       };
       document.body.appendChild(script);
