@@ -54,6 +54,16 @@ import {
   zoomShortcut,
   zoomToSlider,
 } from './uistate.js';
+import {
+  buildPaletteLookup,
+  formatPixelInfo,
+  formatPixelSummary,
+  isLargeResult,
+  paletteIndexOfColor,
+  paletteStats,
+  pixelColorAt,
+  previewPointToPixel,
+} from './palette-link.js';
 
 const MAX_UNDO = 50;
 const LARGE_PROJECT_BYTES = 8 * 1024 * 1024;
@@ -78,6 +88,8 @@ const state = {
   recolorMap: {},
   resultZoom: 4,
   exportScale: 1,
+  // 调色盘联动：悬浮色块时是否在结果预览中高亮同色像素；旧工程缺省为开。
+  hoverHighlight: true,
   createdAt: null,
   updatedAt: null,
   dirty: false,
@@ -112,6 +124,21 @@ let outputTimer = null;
 // 滚轮缩放按帧合并：同一帧内的多个 wheel 事件只重绘 / 重建一次。
 let pendingWheelZoom = null;
 let wheelZoomQueued = false;
+
+// 调色盘联动的当前状态。pixelIndex 是“结果预览”里当前悬停的输出像素；
+// swatchIndex 是鼠标悬停的调色盘色块。两者不会同时存在（鼠标只能在一个区域）。
+const hoverLink = {
+  pendingPoint: null,
+  frameQueued: false,
+  pixelIndex: -1,
+  pixelX: -1,
+  pixelY: -1,
+  pixelHex: null,
+  paletteIndex: -1,
+  swatchIndex: -1,
+  mask: null,
+};
+let paletteLookup = null;
 
 /* ---------- 工具函数 ---------- */
 
@@ -185,6 +212,7 @@ function invalidateAll() {
   finalPalette.length = 0;
   outputImageData = null;
   outputCanvas = null;
+  resetPaletteLink();
 }
 
 /* ---------- 初始化 ---------- */
@@ -220,9 +248,10 @@ function cacheElements() {
     'sourceEmpty', 'btnEmptyImport', 'btnEmptyProject', 'srcInfoBadge',
     'srcDims', 'srcZoom', 'srcOffset', 'srcCrop', 'resultScroll',
     'resultCanvas', 'resultEmpty', 'resultZoomGroup', 'resultTip', 'outDims',
-    'outCrop', 'pixelCount', 'resultColors', 'paletteCount',
+    'outCrop', 'pixelCount', 'resultColors', 'pixelInfo', 'paletteCount',
     'btnImportHex', 'btnExportHex', 'paletteHint', 'paletteList',
-    'paletteEmpty', 'fileImage', 'fileProject', 'fileHex', 'colorPicker',
+    'paletteEmpty', 'hoverHighlight', 'pixelTooltip', 'fileImage',
+    'fileProject', 'fileHex', 'colorPicker',
     'statusText', 'timingText', 'projectState', 'dropOverlay', 'toast',
   ];
   for (const id of ids) el[id] = $(id);
@@ -377,11 +406,20 @@ function bindEvents() {
     if (!button) return;
     const zoom = Number(button.dataset.zoom);
     if (![1, 4, 8].includes(zoom)) return;
+    // 反向高亮的掩码与当前倍数绑定，换挡前先清除，避免旧掩码被按新尺寸拉伸。
+    clearSwatchHighlight(false);
     state.resultZoom = zoom;
     syncResultZoomButtons();
     drawResultScaled();
     centerResultScroll();
   });
+
+  el.resultCanvas.addEventListener('pointermove', onResultPointerMove);
+  el.resultCanvas.addEventListener('pointerleave', onResultPointerLeave);
+  el.resultScroll.addEventListener('scroll', onResultScroll, { passive: true });
+  el.paletteList.addEventListener('pointermove', onPalettePointerMove);
+  el.paletteList.addEventListener('pointerleave', onPalettePointerLeave);
+  el.hoverHighlight.addEventListener('change', onHoverHighlightChange);
 
   el.paletteList.addEventListener('click', (event) => {
     const card = event.target.closest('.swatch-card');
@@ -624,6 +662,7 @@ function resetWorkspaceForSource() {
   state.recolorMap = {};
   state.resultZoom = 4;
   state.exportScale = 1;
+  state.hoverHighlight = true;
   state.createdAt = new Date().toISOString();
   state.updatedAt = null;
   state.dirty = true;
@@ -688,6 +727,7 @@ async function loadProjectText(text, options = {}) {
   state.recolorMap = normalizeRecolorMap(project.recolorMap);
   state.resultZoom = project.ui.resultZoom;
   state.exportScale = project.ui.exportScale;
+  state.hoverHighlight = project.ui.hoverHighlight;
   state.createdAt = project.createdAt;
   state.updatedAt = project.updatedAt;
   state.dirty = false;
@@ -1086,6 +1126,9 @@ function rebuildPipeline() {
     return;
   }
 
+  // 输出像素与调色盘索引都会变化，先让旧的联动高亮失效。
+  resetPaletteLink();
+
   const totalStart = performance.now();
   let resampleTime = 0;
   let quantizeTime = 0;
@@ -1196,6 +1239,7 @@ function drawResultScaled() {
   context.imageSmoothingEnabled = false;
   context.clearRect(0, 0, width, height);
   context.drawImage(outputCanvas, 0, 0, width, height);
+  paintSwatchHighlight(context);
   el.resultTip.textContent = `${zoom}× 最近邻放大 · 实际 ${outputCanvas.width}×${outputCanvas.height}`;
 }
 
@@ -1204,6 +1248,317 @@ function centerResultScroll() {
     el.resultScroll.scrollLeft = Math.max(0, (el.resultScroll.scrollWidth - el.resultScroll.clientWidth) / 2);
     el.resultScroll.scrollTop = Math.max(0, (el.resultScroll.scrollHeight - el.resultScroll.clientHeight) / 2);
   });
+}
+
+/* ---------- 调色盘联动 ---------- */
+
+/**
+ * 颜色 → 调色盘索引。量化索引是权威映射：改色后两个自动色可能落到同一个 HEX，
+ * 此时只有索引能区分色块。仅当索引与读到的颜色对不上时，才退回按 HEX 查表。
+ */
+function resolvePaletteIndex(pixelIndex, hex) {
+  const direct = cache.quantized?.indices?.[pixelIndex];
+  if (Number.isInteger(direct) && direct >= 0 && direct < finalPalette.length
+    && finalPalette[direct]?.hex === hex) {
+    return direct;
+  }
+  if (!paletteLookup) paletteLookup = buildPaletteLookup(finalPalette);
+  const hit = paletteLookup.get(hex);
+  if (hit !== undefined) return hit;
+  return paletteIndexOfColor(finalPalette, hex);
+}
+
+function paletteCardAt(index) {
+  if (!Number.isInteger(index) || index < 0) return null;
+  return el.paletteList.querySelector(`.swatch-card[data-index="${index}"]`);
+}
+
+function removePixelCard(index) {
+  const card = paletteCardAt(index);
+  if (card) card.classList.remove('is-pixel-active');
+}
+
+/** 清空所有联动状态（不重绘画布；调用方通常马上会重建结果）。 */
+function resetPaletteLink() {
+  hoverLink.pendingPoint = null;
+  hoverLink.pixelIndex = -1;
+  hoverLink.pixelX = -1;
+  hoverLink.pixelY = -1;
+  hoverLink.pixelHex = null;
+  hoverLink.paletteIndex = -1;
+  hoverLink.swatchIndex = -1;
+  hoverLink.mask = null;
+  paletteLookup = null;
+
+  if (el.paletteList) {
+    for (const card of el.paletteList.querySelectorAll('.swatch-card.is-pixel-active')) {
+      card.classList.remove('is-pixel-active');
+    }
+  }
+  if (el.pixelTooltip) {
+    el.pixelTooltip.hidden = true;
+    el.pixelTooltip.textContent = '';
+  }
+  if (el.pixelInfo) {
+    el.pixelInfo.textContent = '当前像素：—';
+    el.pixelInfo.classList.remove('has-pixel');
+  }
+}
+
+function clearPixelHover() {
+  removePixelCard(hoverLink.paletteIndex);
+  hoverLink.pixelIndex = -1;
+  hoverLink.pixelX = -1;
+  hoverLink.pixelY = -1;
+  hoverLink.pixelHex = null;
+  hoverLink.paletteIndex = -1;
+  if (el.pixelTooltip) {
+    el.pixelTooltip.hidden = true;
+    el.pixelTooltip.textContent = '';
+  }
+  if (el.pixelInfo) {
+    el.pixelInfo.textContent = '当前像素：—';
+    el.pixelInfo.classList.remove('has-pixel');
+  }
+}
+
+/** 取消色块 → 预览的高亮；repaint 为 true 时立即重画结果预览。 */
+function clearSwatchHighlight(repaint = false) {
+  const active = hoverLink.swatchIndex >= 0;
+  hoverLink.swatchIndex = -1;
+  hoverLink.mask = null;
+  if (active && repaint) drawResultScaled();
+}
+
+function onResultPointerMove(event) {
+  if (!state.source || !outputImageData || !cache.quantized) return;
+  hoverLink.pendingPoint = { x: event.clientX, y: event.clientY };
+  if (hoverLink.frameQueued) return;
+  hoverLink.frameQueued = true;
+  requestAnimationFrame(flushResultHover);
+}
+
+/** 按帧处理预览悬停：同一帧内多次移动只换算一次。 */
+function flushResultHover() {
+  hoverLink.frameQueued = false;
+  const point = hoverLink.pendingPoint;
+  hoverLink.pendingPoint = null;
+  if (!point || !state.source || !outputImageData || !cache.quantized) return;
+
+  const rect = el.resultCanvas.getBoundingClientRect();
+  const hit = previewPointToPixel(point, {
+    left: rect.left,
+    top: rect.top,
+    width: rect.width,
+    height: rect.height,
+    outputWidth: outputImageData.width,
+    outputHeight: outputImageData.height,
+  });
+  if (!hit) {
+    clearPixelHover();
+    return;
+  }
+
+  // 同一像素重复移动：只跟随提示位置，不重复读色、查表或滚动调色盘。
+  if (hit.index === hoverLink.pixelIndex) {
+    positionPixelTooltip(point.x, point.y);
+    return;
+  }
+
+  const color = pixelColorAt(outputImageData, hit.index);
+  if (!color || color.transparent) {
+    clearPixelHover();
+    el.pixelInfo.textContent = formatPixelInfo(hit.x, hit.y, null);
+    return;
+  }
+
+  applyPixelHover(hit, color, resolvePaletteIndex(hit.index, color.hex), point);
+}
+
+function applyPixelHover(hit, color, paletteIndex, point) {
+  removePixelCard(hoverLink.paletteIndex);
+  hoverLink.pixelIndex = hit.index;
+  hoverLink.pixelX = hit.x;
+  hoverLink.pixelY = hit.y;
+  hoverLink.pixelHex = color.hex;
+  hoverLink.paletteIndex = paletteIndex;
+
+  const card = paletteCardAt(paletteIndex);
+  if (card) {
+    card.classList.add('is-pixel-active');
+    revealPaletteCard(card);
+  }
+
+  el.pixelInfo.textContent = formatPixelInfo(hit.x, hit.y, color.hex);
+  el.pixelInfo.classList.add('has-pixel');
+
+  if (!el.pixelTooltip) return;
+  const stats = paletteStats(finalPalette, paletteIndex);
+  el.pixelTooltip.textContent = stats?.hex
+    ? formatPixelSummary(stats.hex, stats.ratio, stats.count)
+    : color.hex.toUpperCase();
+  el.pixelTooltip.hidden = false;
+  positionPixelTooltip(point.x, point.y);
+}
+
+function onResultPointerLeave() {
+  hoverLink.pendingPoint = null;
+  clearPixelHover();
+}
+
+function onResultScroll() {
+  // 滚动后画布相对鼠标的位置已经变了，先取消定位，等下一次移动重新换算。
+  if (hoverLink.pixelIndex >= 0) clearPixelHover();
+}
+
+/** 把调色盘滚动到刚好能看见目标色块的位置，不改变页面滚动。 */
+function revealPaletteCard(card) {
+  const list = el.paletteList;
+  if (!list || !card) return;
+  const listRect = list.getBoundingClientRect();
+  const cardRect = card.getBoundingClientRect();
+  if (cardRect.top >= listRect.top && cardRect.bottom <= listRect.bottom) return;
+  const target = cardRect.top - listRect.top - Math.max(0, (listRect.height - cardRect.height) / 2);
+  list.scrollTop += target;
+}
+
+function positionPixelTooltip(clientX, clientY) {
+  const tip = el.pixelTooltip;
+  if (!tip || tip.hidden) return;
+  const gap = 14;
+  const margin = 8;
+  const width = tip.offsetWidth || 180;
+  const height = tip.offsetHeight || 24;
+  let left = clientX + gap;
+  let top = clientY + gap;
+  if (left + width > window.innerWidth - margin) left = clientX - width - gap;
+  if (left < margin) left = margin;
+  if (top + height > window.innerHeight - margin) top = clientY - height - gap;
+  if (top < margin) top = margin;
+  tip.style.left = `${Math.round(left)}px`;
+  tip.style.top = `${Math.round(top)}px`;
+}
+
+/* ---- 色块 → 预览像素（反向） ---- */
+
+function onPalettePointerMove(event) {
+  const card = event.target.closest?.('.swatch-card');
+  if (!card) {
+    clearSwatchHighlight(true);
+    return;
+  }
+  const index = Number(card.dataset.index);
+  if (!Number.isInteger(index) || index === hoverLink.swatchIndex) return;
+  if (!state.hoverHighlight || !outputImageData || !cache.quantized) {
+    clearSwatchHighlight(true);
+    return;
+  }
+  hoverLink.swatchIndex = index;
+  hoverLink.mask = null;
+  drawResultScaled();
+}
+
+function onPalettePointerLeave() {
+  clearSwatchHighlight(true);
+}
+
+function onHoverHighlightChange() {
+  state.hoverHighlight = Boolean(el.hoverHighlight.checked);
+  if (!state.hoverHighlight) clearSwatchHighlight(true);
+}
+
+/**
+ * 为某个调色板索引预生成掩码 canvas（输出分辨率）与边界路径（显示分辨率）。
+ * 大结果只保留掩码，不逐像素描边；两种方式都只在悬停色块变化时计算一次。
+ */
+function buildSwatchHighlight(index, width, height, zoom) {
+  const cached = hoverLink.mask;
+  if (cached
+    && cached.index === index
+    && cached.zoom === zoom
+    && cached.width === width
+    && cached.height === height) {
+    return cached;
+  }
+
+  const indices = cache.quantized?.indices;
+  if (!indices || indices.length !== width * height) return null;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d');
+  if (!context) return null;
+
+  const image = context.createImageData(width, height);
+  const data = image.data;
+  // 1× 显示时单个输出像素只有 1×1，1px 描边会盖住原色，因此只提亮不描边。
+  const drawEdges = zoom >= 2;
+  const edges = drawEdges && !isLargeResult(width, height) && typeof Path2D === 'function'
+    ? new Path2D()
+    : null;
+  const fillAlpha = drawEdges ? 64 : 76;
+
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width;
+    for (let x = 0; x < width; x += 1) {
+      const pixel = row + x;
+      if (indices[pixel] !== index) continue;
+
+      // 半透明白色只提亮、不覆盖原色；2× 及以上再用 1px 青色线勾出边界。
+      const offset = pixel * 4;
+      data[offset] = 255;
+      data[offset + 1] = 255;
+      data[offset + 2] = 255;
+      data[offset + 3] = fillAlpha;
+
+      if (!edges) continue;
+      const left = x * zoom;
+      const top = y * zoom;
+      const right = left + zoom;
+      const bottom = top + zoom;
+      if (y === 0 || indices[pixel - width] !== index) {
+        edges.moveTo(left, top + 0.5);
+        edges.lineTo(right, top + 0.5);
+      }
+      if (y === height - 1 || indices[pixel + width] !== index) {
+        edges.moveTo(left, bottom - 0.5);
+        edges.lineTo(right, bottom - 0.5);
+      }
+      if (x === 0 || indices[pixel - 1] !== index) {
+        edges.moveTo(left + 0.5, top);
+        edges.lineTo(left + 0.5, bottom);
+      }
+      if (x === width - 1 || indices[pixel + 1] !== index) {
+        edges.moveTo(right - 0.5, top);
+        edges.lineTo(right - 0.5, bottom);
+      }
+    }
+  }
+
+  context.putImageData(image, 0, 0);
+  hoverLink.mask = { index, width, height, zoom, canvas, edges };
+  return hoverLink.mask;
+}
+
+function paintSwatchHighlight(context) {
+  if (!state.hoverHighlight || hoverLink.swatchIndex < 0) return;
+  if (!outputImageData || !cache.quantized) return;
+
+  const width = outputImageData.width;
+  const height = outputImageData.height;
+  const mask = buildSwatchHighlight(hoverLink.swatchIndex, width, height, state.resultZoom);
+  if (!mask) return;
+
+  context.save();
+  context.imageSmoothingEnabled = false;
+  context.drawImage(mask.canvas, 0, 0, el.resultCanvas.width, el.resultCanvas.height);
+  if (mask.edges) {
+    context.strokeStyle = 'rgba(45, 212, 191, 0.9)';
+    context.lineWidth = 1;
+    context.stroke(mask.edges);
+  }
+  context.restore();
 }
 
 /* ---------- 改色 ---------- */
@@ -1219,6 +1574,8 @@ function scheduleRecolorRefresh() {
 
 function refreshRecolorOnly() {
   if (!cache.quantized || !cache.resampled) return;
+  // 改色会改变颜色与色块内容，旧的像素定位/色块高亮不再可信。
+  resetPaletteLink();
   const start = performance.now();
   finalPalette.length = 0;
   finalPalette.push(...resolvePalette(cache.quantized.palette, state.recolorMap));
@@ -1411,6 +1768,8 @@ function updateActionAvailability() {
 
 function renderPalette() {
   const token = ++paletteRenderToken;
+  // 调色盘重新渲染后，颜色 → 索引查表必须重建。
+  paletteLookup = null;
   const total = finalPalette.length;
   const scrollTop = el.paletteList.scrollTop;
   el.paletteList.replaceChildren();
@@ -1490,6 +1849,7 @@ function syncAllControls() {
   el.targetColors.value = String(state.maxColors);
   el.ditherToggle.checked = state.dither;
   el.exportScale.value = String(state.exportScale);
+  el.hoverHighlight.checked = state.hoverHighlight;
   syncResultZoomButtons();
   updateExportMeta();
   updateActionAvailability();
@@ -1667,6 +2027,7 @@ function makeProjectText() {
       exportScale: state.exportScale,
       // 源图缩放百分比：恢复时优先使用，旧工程缺省时由 transform.scale 推导。
       sourceZoom: Math.round(zoomPercent(state.transform.scale) * 100) / 100,
+      hoverHighlight: state.hoverHighlight,
     },
   }, {
     createdAt: state.createdAt,
@@ -1805,6 +2166,7 @@ function getDebugState() {
     dither: state.dither,
     recolorMap: { ...state.recolorMap },
     resultZoom: state.resultZoom,
+    hoverHighlight: state.hoverHighlight,
     colors: finalPalette.length,
     approximate: Boolean(cache.quantized?.approximate),
     timings: { ...lastTimings },
@@ -1892,6 +2254,29 @@ function exposeDebugApi() {
       return getDebugState();
     },
     getTimings: () => ({ ...lastTimings }),
+    getHoverState() {
+      return {
+        hoverHighlight: state.hoverHighlight,
+        pixel: hoverLink.pixelIndex >= 0
+          ? {
+            index: hoverLink.pixelIndex,
+            x: hoverLink.pixelX,
+            y: hoverLink.pixelY,
+            hex: hoverLink.pixelHex,
+            paletteIndex: hoverLink.paletteIndex,
+          }
+          : null,
+        swatchIndex: hoverLink.swatchIndex,
+        pixelCardActive: Boolean(el.paletteList.querySelector('.swatch-card.is-pixel-active')),
+        tooltip: el.pixelTooltip && !el.pixelTooltip.hidden ? el.pixelTooltip.textContent : null,
+      };
+    },
+    setHoverHighlight(value) {
+      state.hoverHighlight = Boolean(value);
+      el.hoverHighlight.checked = state.hoverHighlight;
+      if (!state.hoverHighlight) clearSwatchHighlight(true);
+      return getDebugState();
+    },
     getResultDataUrl(factor = 1) {
       if (!outputCanvas) throw new Error('尚无结果');
       const scale = Math.max(1, Math.min(16, Math.round(factor)));

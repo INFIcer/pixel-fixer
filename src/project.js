@@ -79,6 +79,8 @@ function normalizeUi(value, fallbackScale = 1) {
     exportScale: [1, 2, 4, 8, 16].includes(exportScale) ? exportScale : 1,
     // 源图缩放百分比（10~1600）：与 transform.scale 对应，便于阅读与恢复。
     sourceZoom: zoomPercentValue(ui.sourceZoom, fallbackScale),
+    // 调色盘联动开关：只有明确写入 false 才关闭；旧工程缺省视为开启。
+    hoverHighlight: ui.hoverHighlight !== false,
   };
 }
 

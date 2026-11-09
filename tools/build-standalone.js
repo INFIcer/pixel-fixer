@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
-const modules = ['color', 'resample', 'quantize', 'exporter', 'project', 'engine', 'uistate', 'app'];
+const modules = ['color', 'resample', 'quantize', 'exporter', 'project', 'engine', 'uistate', 'palette-link', 'app'];
 const outputPath = path.join(root, 'src', 'standalone.js');
 
 function indent(text, spaces = 2) {

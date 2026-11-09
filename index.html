@@ -252,6 +252,7 @@
             <span id="outCrop">裁切 —</span>
             <span id="pixelCount">4096 像素</span>
             <span id="resultColors">0 色</span>
+            <span id="pixelInfo">当前像素：—</span>
           </footer>
         </section>
       </section>
@@ -267,6 +268,13 @@
         <div class="palette-tools">
           <button type="button" id="btnImportHex" class="btn btn-small">导入 HEX</button>
           <button type="button" id="btnExportHex" class="btn btn-small">导出 HEX</button>
+        </div>
+        <div class="palette-hover">
+          <label class="check-line palette-hover-toggle" title="悬浮色块时，在预览中标出该颜色的像素。">
+            <input id="hoverHighlight" type="checkbox" checked>
+            <span>悬停色块时高亮像素</span>
+          </label>
+          <p class="hint palette-hover-hint">悬浮色块时，在预览中标出该颜色的像素。</p>
         </div>
         <div class="palette-legend">
           <span>点击色块改色 · 改动应用到整张图</span>
@@ -304,6 +312,7 @@
   </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div class="pixel-tooltip" id="pixelTooltip" hidden></div>
 
   <input type="file" id="fileImage" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/avif" hidden>
   <input type="file" id="fileProject" accept=".json,.pixfix.json,application/json" hidden>

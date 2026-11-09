@@ -93,6 +93,25 @@ test('UI 缩放：保存/恢复 sourceZoom，旧工程按 transform.scale 回退
   assert.equal(parseProject(JSON.stringify(oldRaw)).ui.sourceZoom, 250);
 });
 
+test('UI 联动开关：缺省开启，显式 false 保持关闭', () => {
+  const project = example();
+  assert.equal(project.ui.hoverHighlight, true);
+
+  const raw = JSON.parse(serializeProject(project));
+  delete raw.ui.hoverHighlight;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.hoverHighlight, true);
+
+  raw.ui.hoverHighlight = false;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.hoverHighlight, false);
+
+  raw.ui.hoverHighlight = true;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.hoverHighlight, true);
+
+  // 非布尔旧值按“未关闭”处理，避免工程编辑出错时意外关闭功能。
+  raw.ui.hoverHighlight = 'false';
+  assert.equal(parseProject(JSON.stringify(raw)).ui.hoverHighlight, true);
+});
+
 test('序列化 / 反序列化往返一致', () => {
   const project = example();
   const text = serializeProject(project);

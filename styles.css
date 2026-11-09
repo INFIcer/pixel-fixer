@@ -1026,6 +1026,7 @@ select:focus {
   image-rendering: pixelated;
   image-rendering: crisp-edges;
   background-color: transparent;
+  cursor: crosshair;
   box-shadow:
     0 0 0 1px rgba(104, 130, 154, 0.28),
     0 18px 50px rgba(0, 0, 0, 0.45);
@@ -1101,6 +1102,10 @@ select:focus {
   color: #344556;
 }
 
+#pixelInfo.has-pixel {
+  color: var(--accent-soft);
+}
+
 /* ---------- 调色盘 ---------- */
 
 .palette-panel {
@@ -1129,6 +1134,29 @@ select:focus {
   grid-template-columns: 1fr 1fr;
   gap: 7px;
   padding: 0 15px 11px;
+}
+
+.palette-hover {
+  padding: 0 15px 10px;
+}
+
+.palette-hover .check-line {
+  margin-top: 0;
+  gap: 7px;
+  font-size: 10.5px;
+}
+
+.palette-hover .check-line input {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+
+.palette-hover-hint {
+  margin-top: 4px;
+  padding-left: 21px;
+  font-size: 9.5px;
+  line-height: 1.45;
 }
 
 .palette-legend {
@@ -1196,6 +1224,28 @@ select:focus {
   height: 5px;
   border-radius: 50%;
   background: var(--amber);
+}
+
+/* 预览像素定位到的色块：描边加粗 + 轻微放大 + 发光。 */
+.swatch-card.is-pixel-active {
+  z-index: 1;
+  border-color: var(--accent);
+  background: #16242e;
+  box-shadow:
+    0 0 0 1px rgba(45, 212, 191, 0.38),
+    0 0 14px rgba(45, 212, 191, 0.2);
+  transform: translateY(-1px) scale(1.02);
+}
+
+.swatch-card.is-pixel-active .swatch-chip {
+  border-color: rgba(153, 246, 228, 0.75);
+  box-shadow:
+    inset 0 0 0 1px rgba(0, 0, 0, 0.18),
+    0 0 10px rgba(45, 212, 191, 0.28);
+}
+
+.swatch-card.is-pixel-active .swatch-hex {
+  color: var(--accent-soft);
 }
 
 .swatch-chip {
@@ -1356,6 +1406,29 @@ select:focus {
 
 .toast.is-success {
   border-color: rgba(45, 212, 191, 0.42);
+}
+
+/* 预览像素的跟随提示：颜色值 · 占比 · 像素数。 */
+.pixel-tooltip {
+  position: fixed;
+  z-index: 80;
+  max-width: 280px;
+  padding: 5px 8px;
+  border: 1px solid rgba(45, 212, 191, 0.45);
+  border-radius: 6px;
+  background: rgba(8, 14, 20, 0.94);
+  color: var(--accent-soft);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(6px);
+}
+
+.pixel-tooltip[hidden] {
+  display: none;
 }
 
 .drop-overlay {
