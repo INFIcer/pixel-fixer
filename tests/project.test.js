@@ -69,6 +69,30 @@ test('UI 状态：旧工程缺少 exportScale 时回退为 1，非法值被拒�
   assert.equal(parseProject(JSON.stringify(raw)).ui.resultZoom, 4);
 });
 
+test('UI 缩放：保存/恢复 sourceZoom，旧工程按 transform.scale 回退', () => {
+  // 新工程：显式保存的百分比优先。
+  const exampleProject = example();
+  assert.equal(exampleProject.ui.sourceZoom, 175);
+
+  const raw = JSON.parse(serializeProject(exampleProject));
+  raw.ui.sourceZoom = 250;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.sourceZoom, 250);
+
+  // 越界与非法值被夹到 10%~1600%。
+  raw.ui.sourceZoom = 5000;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.sourceZoom, 1600);
+  raw.ui.sourceZoom = 0;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.sourceZoom, 10);
+  raw.ui.sourceZoom = 'abc';
+  assert.equal(parseProject(JSON.stringify(raw)).ui.sourceZoom, 175);
+
+  // 旧工程（没有 ui.sourceZoom）按 transform.scale 回退。
+  const oldRaw = JSON.parse(serializeProject(exampleProject));
+  delete oldRaw.ui.sourceZoom;
+  oldRaw.transform.scale = 2.5;
+  assert.equal(parseProject(JSON.stringify(oldRaw)).ui.sourceZoom, 250);
+});
+
 test('序列化 / 反序列化往返一致', () => {
   const project = example();
   const text = serializeProject(project);

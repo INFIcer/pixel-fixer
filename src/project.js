@@ -58,7 +58,18 @@ function normalizeRecolorMap(value) {
   return result;
 }
 
-function normalizeUi(value) {
+/**
+ * 缩放百分比规范化：旧工程没有 ui.sourceZoom 时，用 transform.scale 推导，
+ * 这样旧文件仍能恢复到保存时的缩放，而不是被重置为 100%。
+ */
+function zoomPercentValue(value, fallbackScale) {
+  const fallbackPercent = (Number(fallbackScale) || 1) * 100;
+  const number = Number(value);
+  const percent = Number.isFinite(number) ? number : fallbackPercent;
+  return Math.round(Math.max(10, Math.min(1600, percent)) * 100) / 100;
+}
+
+function normalizeUi(value, fallbackScale = 1) {
   const ui = value && typeof value === 'object' ? value : {};
   const zoom = Number(ui.resultZoom);
   const exportScale = Number(ui.exportScale);
@@ -66,6 +77,8 @@ function normalizeUi(value) {
     resultZoom: [1, 4, 8].includes(zoom) ? zoom : 4,
     lockAspect: Boolean(ui.lockAspect),
     exportScale: [1, 2, 4, 8, 16].includes(exportScale) ? exportScale : 1,
+    // 源图缩放百分比（10~1600）：与 transform.scale 对应，便于阅读与恢复。
+    sourceZoom: zoomPercentValue(ui.sourceZoom, fallbackScale),
   };
 }
 
@@ -121,7 +134,7 @@ export function normalizeProject(raw) {
     palette: normalizePalette(raw.palette, 'palette'),
     recolorMap: normalizeRecolorMap(raw.recolorMap),
     manualPalette: normalizePalette(raw.manualPalette, 'manualPalette'),
-    ui: normalizeUi(raw.ui),
+    ui: normalizeUi(raw.ui, transform.scale),
   };
 }
 

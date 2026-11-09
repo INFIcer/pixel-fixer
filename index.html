@@ -70,19 +70,25 @@
               <small id="aspectLabel">1 : 1</small>
             </label>
 
-            <div class="field-block">
+            <div class="field-block zoom-block">
               <div class="field-header">
                 <span>源图缩放</span>
-                <output id="zoomValue" class="value-chip" for="zoomRange">100%</output>
+                <span class="zoom-stepper" role="group" aria-label="源图缩放微调">
+                  <button type="button" id="btnZoomOut" class="zoom-step" aria-label="缩小（按住 Shift 精调）" title="缩小 2%（按住 Shift 为 0.5%）">−</button>
+                  <input id="zoomInput" class="zoom-input" type="text" inputmode="decimal" aria-label="源图缩放百分比" value="100%" spellcheck="false" autocomplete="off">
+                  <button type="button" id="btnZoomIn" class="zoom-step" aria-label="放大（按住 Shift 精调）" title="放大 2%（按住 Shift 为 0.5%）">+</button>
+                </span>
               </div>
-              <input id="zoomRange" class="range" type="range" min="10" max="1600" step="5" value="100">
-              <div class="range-scale"><span>10%</span><span>1600%</span></div>
+              <input id="zoomRange" class="range" type="range" min="0" max="1000" step="1" value="454" aria-label="源图缩放（对数刻度 10%~1600%）">
+              <div class="range-scale"><span>10%</span><span class="range-scale-mid">对数刻度</span><span>1600%</span></div>
             </div>
 
-            <div class="inline-actions">
-              <button type="button" id="btnResetCrop" class="btn btn-small">重置裁切</button>
-              <span class="hint">拖拽平移 · 滚轮缩放</span>
+            <div class="inline-actions zoom-actions">
+              <button type="button" id="btnZoomFit" class="btn btn-small" title="让整张源图落入预览窗口（F）">适应窗口</button>
+              <button type="button" id="btnZoomActual" class="btn btn-small" title="缩放回 100%（0）">1:1</button>
+              <button type="button" id="btnResetCrop" class="btn btn-small" title="缩放 100% 并居中">重置裁切</button>
             </div>
+            <p class="hint zoom-hint">滚轮缩放 · Shift 精调 · 拖拽平移</p>
           </section>
 
           <section class="control-section">
@@ -206,7 +212,7 @@
                 <button type="button" class="btn btn-small" id="btnEmptyProject">打开工程</button>
               </div>
             </div>
-            <div class="canvas-hud">拖拽平移 · 滚轮缩放 · 框内为导出范围</div>
+            <div class="canvas-hud">拖拽平移 · 滚轮缩放 · Shift 精调 · 框内为导出范围</div>
           </div>
           <footer class="preview-footer">
             <span id="srcDims">源图 —</span>

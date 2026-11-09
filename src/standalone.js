@@ -1509,7 +1509,18 @@
       return result;
     }
 
-    function normalizeUi(value) {
+    /**
+     * 缩放百分比规范化：旧工程没有 ui.sourceZoom 时，用 transform.scale 推导，
+     * 这样旧文件仍能恢复到保存时的缩放，而不是被重置为 100%。
+     */
+    function zoomPercentValue(value, fallbackScale) {
+      const fallbackPercent = (Number(fallbackScale) || 1) * 100;
+      const number = Number(value);
+      const percent = Number.isFinite(number) ? number : fallbackPercent;
+      return Math.round(Math.max(10, Math.min(1600, percent)) * 100) / 100;
+    }
+
+    function normalizeUi(value, fallbackScale = 1) {
       const ui = value && typeof value === 'object' ? value : {};
       const zoom = Number(ui.resultZoom);
       const exportScale = Number(ui.exportScale);
@@ -1517,6 +1528,8 @@
         resultZoom: [1, 4, 8].includes(zoom) ? zoom : 4,
         lockAspect: Boolean(ui.lockAspect),
         exportScale: [1, 2, 4, 8, 16].includes(exportScale) ? exportScale : 1,
+        // 源图缩放百分比（10~1600）：与 transform.scale 对应，便于阅读与恢复。
+        sourceZoom: zoomPercentValue(ui.sourceZoom, fallbackScale),
       };
     }
 
@@ -1572,7 +1585,7 @@
         palette: normalizePalette(raw.palette, 'palette'),
         recolorMap: normalizeRecolorMap(raw.recolorMap),
         manualPalette: normalizePalette(raw.manualPalette, 'manualPalette'),
-        ui: normalizeUi(raw.ui),
+        ui: normalizeUi(raw.ui, transform.scale),
       };
     }
 
@@ -1814,12 +1827,12 @@
 
   __define("uistate", function (__exports, __require) {
     "use strict";
-    // 界面纯逻辑：显示格式、宽高比锁定、导出信息。
+    // 界面纯逻辑：显示格式、宽高比锁定、导出信息、缩放数学。
     // 这里不触碰 DOM，便于在 Node 中直接测试；src/app.js 只负责取值与渲染。
 
     const { clamp } = __require("color");
     const { buildExportFilename } = __require("exporter");
-    const { normalizeOutputSize } = __require("engine");
+    const { computeCropRect, constrainTransform, normalizeOutputSize } = __require("engine");
 
     /** 最大公约数，用于化简宽高比。 */
     function gcd(a, b) {
@@ -1928,7 +1941,299 @@
       return clamp(((current - low) / (high - low)) * 100, 0, 100);
     }
 
-    Object.assign(__exports, { gcd, aspectLabel, formatBytes, formatPercent, applyAspectLock, buildExportMeta, defaultClipboardName, rangeProgress });
+    /* ---------- 缩放数学（纯逻辑，app.js 与测试共用） ---------- */
+
+    /** 缩放范围：10%~1600%，与 engine.js 的 MIN_SCALE / MAX_SCALE 保持一致。 */
+    const ZOOM_MIN = 0.1;
+    const ZOOM_MAX = 16;
+    const ZOOM_MIN_PERCENT = ZOOM_MIN * 100;
+    const ZOOM_MAX_PERCENT = ZOOM_MAX * 100;
+
+    /** 对数滑块的内部刻度：0 对应 10%，1000 对应 1600%。 */
+    const ZOOM_SLIDER_MAX = 1000;
+
+    /** 微调按钮的倍率：普通 1.02，按住 Shift 时 1.005。 */
+    const ZOOM_STEP = 1.02;
+    const ZOOM_STEP_FINE = 1.005;
+
+    /** 滚轮指数缩放系数：factor = e^(-deltaY * 0.0015)，Shift 时再乘 0.25。 */
+    const WHEEL_ZOOM_SENSITIVITY = 0.0015;
+    const WHEEL_ZOOM_FINE = 0.25;
+
+    /** 预览区留白，与 app.js 绘制裁切框时使用的边距一致。 */
+    const ZOOM_FRAME_PADDING = 28;
+
+    /** 把缩放值夹到 10%~1600%；非法值回退到 100%。 */
+    function clampZoom(scale) {
+      const value = Number(scale);
+      if (!Number.isFinite(value)) return 1;
+      return clamp(value, ZOOM_MIN, ZOOM_MAX);
+    }
+
+    /** 缩放值 → 百分比数值（未取整，便于继续计算）。 */
+    function zoomPercent(scale) {
+      return clampZoom(scale) * 100;
+    }
+
+    /**
+     * 百分比展示：低于 100% 时保留 1 位小数（10.5%），100% 以上取整（137%）。
+     * 显示只影响文案，不改变真实缩放值。
+     */
+    function formatZoomPercent(scale) {
+      const percent = zoomPercent(scale);
+      if (percent < 100) {
+        const rounded = Math.round(percent * 10) / 10;
+        return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}%`;
+      }
+      return `${Math.round(percent)}%`;
+    }
+
+    /** 百分比 → 缩放值（夹到 10%~1600%）。 */
+    function zoomFromPercent(percent) {
+      const value = Number(percent);
+      if (!Number.isFinite(value)) return 1;
+      return clampZoom(value / 100);
+    }
+
+    /**
+     * 解析百分比输入框：允许 "137%"、"137"、" 137.5 % "，空值或非数字回退到 fallback。
+     * 越界值直接夹到 10%~1600%（例如 5000% → 1600%，0% → 10%）。
+     */
+    function parseZoomInput(text, fallbackScale = 1) {
+      const fallback = clampZoom(fallbackScale);
+      const raw = String(text ?? '').replace(/[%\s]/g, '').replace(',', '.');
+      if (!raw) return fallback;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return fallback;
+      return clampZoom(value / 100);
+    }
+
+    /** 百分比 → 对数滑块位置（0~1000），拖动时连续变化。 */
+    function percentToSlider(percent) {
+      const numeric = Number(percent);
+      const safe = Number.isFinite(numeric) ? numeric : ZOOM_MIN_PERCENT;
+      const clamped = clamp(safe, ZOOM_MIN_PERCENT, ZOOM_MAX_PERCENT);
+      const ratio = Math.log(clamped / ZOOM_MIN_PERCENT)
+        / Math.log(ZOOM_MAX_PERCENT / ZOOM_MIN_PERCENT);
+      return clamp(ratio * ZOOM_SLIDER_MAX, 0, ZOOM_SLIDER_MAX);
+    }
+
+    /** 对数滑块位置 → 百分比，是 percentToSlider 的逆运算。 */
+    function sliderToPercent(value) {
+      const numeric = Number(value);
+      const safe = Number.isFinite(numeric) ? numeric : 0;
+      const ratio = clamp(safe, 0, ZOOM_SLIDER_MAX) / ZOOM_SLIDER_MAX;
+      return ZOOM_MIN_PERCENT * (ZOOM_MAX_PERCENT / ZOOM_MIN_PERCENT) ** ratio;
+    }
+
+    /** 缩放值 ↔ 滑块位置。 */
+    function zoomToSlider(scale) {
+      return percentToSlider(zoomPercent(scale));
+    }
+
+    function sliderToZoom(value) {
+      return zoomFromPercent(sliderToPercent(value));
+    }
+
+    /**
+     * 滚轮缩放因子：factor = exp(-deltaY * 0.0015 * (shift ? 0.25 : 1))。
+     * 连续指数缩放不会在挡位之间跳变；无效 deltaY 返回 1（不动）。
+     */
+    function wheelZoomFactor(deltaY, options = {}) {
+      const delta = Number(deltaY);
+      if (!Number.isFinite(delta) || delta === 0) return 1;
+      const fine = options && options.shift ? WHEEL_ZOOM_FINE : 1;
+      return Math.exp(-delta * WHEEL_ZOOM_SENSITIVITY * fine);
+    }
+
+    /** 微调倍率：普通 1.02，Shift 1.005。 */
+    function zoomStepFactor(fine = false) {
+      return fine ? ZOOM_STEP_FINE : ZOOM_STEP;
+    }
+
+    /**
+     * 单次 +/- 微调。direction > 0 放大，< 0 缩小；结果夹在 10%~1600%。
+     * @param {number} scale 当前缩放
+     * @param {number} direction 方向（通常为 +1 / -1）
+     * @param {boolean} [fine] 是否精调（Shift）
+     */
+    function stepZoom(scale, direction, fine = false) {
+      const factor = zoomStepFactor(fine);
+      const next = clampZoom(scale) * (Number(direction) < 0 ? 1 / factor : factor);
+      return clampZoom(next);
+    }
+
+    /**
+     * 键盘快捷键映射：+ / - 缩放，0 回到 1:1，f 适应窗口。
+     * 输入框（含滑块）、可编辑元素聚焦时不触发；带 Ctrl / Cmd / Alt 的组合同样忽略。
+     * @returns {'zoom-in'|'zoom-out'|'reset'|'fit'|null}
+     */
+    function zoomShortcut(event, editing = false) {
+      if (editing || !event) return null;
+      if (event.ctrlKey || event.metaKey || event.altKey) return null;
+      const key = String(event.key || '').toLowerCase();
+      if (key === '+' || key === '=') return 'zoom-in';
+      if (key === '-' || key === '_') return 'zoom-out';
+      if (key === '0') return 'reset';
+      if (key === 'f') return 'fit';
+      return null;
+    }
+
+    /**
+     * 计算源图预览里“输出裁切框”的位置与尺寸（画布 CSS 像素坐标）。
+     * 绘制与“适应窗口”共用，避免两处几何口径不一致。
+     */
+    function computeFrame(viewportWidth, viewportHeight, aspect, padding = ZOOM_FRAME_PADDING) {
+      const width = Math.max(1, Number(viewportWidth) || 1);
+      const height = Math.max(1, Number(viewportHeight) || 1);
+      const numericAspect = Number(aspect);
+      const safeAspect = Number.isFinite(numericAspect) && numericAspect > 0 ? numericAspect : 1;
+      const pad = Math.max(0, Number(padding) || 0);
+      const availableW = Math.max(40, width - pad * 2);
+      const availableH = Math.max(40, height - pad * 2);
+      let frameWidth = Math.min(availableW, availableH * safeAspect);
+      let frameHeight = frameWidth / safeAspect;
+      if (frameHeight > availableH) {
+        frameHeight = availableH;
+        frameWidth = frameHeight * safeAspect;
+      }
+      return {
+        x: (width - frameWidth) / 2,
+        y: (height - frameHeight) / 2,
+        width: frameWidth,
+        height: frameHeight,
+      };
+    }
+
+    /**
+     * “适应窗口”的缩放值：让整张源图都落在预览画布内。
+     * 推导：viewScale = frame.width / crop.width = frame.width * scale / fitWidth，
+     * 因此源图显示尺寸 = 源图尺寸 * frame.width * scale / fitWidth；
+     * 分别对宽、高解出上限，取较小者，最后夹到 10%~1600%。
+     */
+    function fitZoom(
+      sourceWidth,
+      sourceHeight,
+      outputWidth,
+      outputHeight,
+      viewportWidth,
+      viewportHeight,
+      padding = ZOOM_FRAME_PADDING,
+    ) {
+      const sw = Number(sourceWidth);
+      const sh = Number(sourceHeight);
+      const ow = Number(outputWidth);
+      const oh = Number(outputHeight);
+      if (!(sw > 0) || !(sh > 0) || !(ow > 0) || !(oh > 0)) return 1;
+
+      const aspect = ow / oh;
+      const frame = computeFrame(viewportWidth, viewportHeight, aspect, padding);
+      if (!(frame.width > 0)) return 1;
+
+      const fit = computeCropRect(sw, sh, ow, oh, 1, 0, 0);
+      const pad = Math.max(0, Number(padding) || 0);
+      const availableW = Math.max(40, (Number(viewportWidth) || 1) - pad * 2);
+      const availableH = Math.max(40, (Number(viewportHeight) || 1) - pad * 2);
+
+      const scaleX = (availableW * fit.fitWidth) / (sw * frame.width);
+      const scaleY = (availableH * fit.fitWidth) / (sh * frame.width);
+      return clampZoom(Math.min(scaleX, scaleY));
+    }
+
+    /**
+     * 以画布上的某个点为锚点缩放：保证缩放前后，鼠标下的源图像素坐标不变。
+     * 通过“旧视图反推源图坐标 → 新视图反推裁切中心”实现，最后交给
+     * constrainTransform 约束偏移（贴边时锚点会被边界限制，这是预期行为）。
+     *
+     * @param {object} input
+     * @param {number} input.sourceWidth 源图宽
+     * @param {number} input.sourceHeight 源图高
+     * @param {number} input.outputWidth 输出宽
+     * @param {number} input.outputHeight 输出高
+     * @param {number} input.scale 旧缩放
+     * @param {number} input.offsetX 旧裁切中心偏移
+     * @param {number} input.offsetY 旧裁切中心偏移
+     * @param {number} input.newScale 目标缩放
+     * @param {number} input.pointerX 锚点画布 X（CSS 像素）
+     * @param {number} input.pointerY 锚点画布 Y（CSS 像素）
+     * @param {{x:number,y:number,width:number,height:number}} input.frame 当前视图的裁切框
+     * @returns {{scale:number,offsetX:number,offsetY:number}}
+     */
+    function zoomAroundPoint(input) {
+      const {
+        sourceWidth,
+        sourceHeight,
+        outputWidth,
+        outputHeight,
+        scale,
+        offsetX = 0,
+        offsetY = 0,
+        newScale,
+        pointerX,
+        pointerY,
+        frame,
+      } = input || {};
+
+      const base = clampZoom(scale);
+      const safeOffsetX = Number.isFinite(Number(offsetX)) ? Number(offsetX) : 0;
+      const safeOffsetY = Number.isFinite(Number(offsetY)) ? Number(offsetY) : 0;
+      const fallback = { scale: base, offsetX: safeOffsetX, offsetY: safeOffsetY };
+
+      const frameWidth = Number(frame?.width);
+      const frameHeight = Number(frame?.height);
+      const x = Number(pointerX);
+      const y = Number(pointerY);
+      const valid = sourceWidth > 0 && sourceHeight > 0 && outputWidth > 0 && outputHeight > 0
+        && frameWidth > 0 && frameHeight > 0 && Number.isFinite(x) && Number.isFinite(y);
+      if (!valid) return fallback;
+
+      const target = clampZoom(newScale);
+      const oldCrop = computeCropRect(
+        sourceWidth,
+        sourceHeight,
+        outputWidth,
+        outputHeight,
+        base,
+        safeOffsetX,
+        safeOffsetY,
+      );
+      const oldViewScale = frameWidth / oldCrop.width;
+      if (!(oldViewScale > 0) || !Number.isFinite(oldViewScale)) return fallback;
+
+      const frameCenterX = Number(frame.x || 0) + frameWidth / 2;
+      const frameCenterY = Number(frame.y || 0) + frameHeight / 2;
+      // 锚点处的源图坐标（缩放前）。
+      const imageX = oldCrop.x + oldCrop.width / 2 + (x - frameCenterX) / oldViewScale;
+      const imageY = oldCrop.y + oldCrop.height / 2 + (y - frameCenterY) / oldViewScale;
+
+      const freeCrop = computeCropRect(
+        sourceWidth,
+        sourceHeight,
+        outputWidth,
+        outputHeight,
+        target,
+        0,
+        0,
+      );
+      const newViewScale = frameWidth / freeCrop.width;
+      if (!(newViewScale > 0) || !Number.isFinite(newViewScale)) return fallback;
+
+      // 反推新的裁切中心，使同一个源图坐标仍落在锚点下。
+      const centerX = imageX - (x - frameCenterX) / newViewScale;
+      const centerY = imageY - (y - frameCenterY) / newViewScale;
+
+      return constrainTransform(
+        sourceWidth,
+        sourceHeight,
+        outputWidth,
+        outputHeight,
+        target,
+        centerX - sourceWidth / 2,
+        centerY - sourceHeight / 2,
+      );
+    }
+
+    Object.assign(__exports, { gcd, aspectLabel, formatBytes, formatPercent, applyAspectLock, buildExportMeta, defaultClipboardName, rangeProgress, ZOOM_MIN, ZOOM_MAX, ZOOM_MIN_PERCENT, ZOOM_MAX_PERCENT, ZOOM_SLIDER_MAX, ZOOM_STEP, ZOOM_STEP_FINE, WHEEL_ZOOM_SENSITIVITY, WHEEL_ZOOM_FINE, ZOOM_FRAME_PADDING, clampZoom, zoomPercent, formatZoomPercent, zoomFromPercent, parseZoomInput, percentToSlider, sliderToPercent, zoomToSlider, sliderToZoom, wheelZoomFactor, zoomStepFactor, stepZoom, zoomShortcut, computeFrame, fitZoom, zoomAroundPoint });
   });
 
   __define("app", function (__exports, __require) {
@@ -1938,11 +2243,11 @@
 
     const { RESAMPLE_METHODS, isValidResample } = __require("resample");
     const { createColorModel, quantize } = __require("quantize");
-    const { computeCropRect, constrainTransform, resampleOutput, resolvePalette, composeOutput, clampScale, normalizeOutputSize, normalizeRecolorMap } = __require("engine");
+    const { computeCropRect, constrainTransform, resampleOutput, resolvePalette, composeOutput, normalizeOutputSize, normalizeRecolorMap } = __require("engine");
     const { createProject, serializeProject, parseProject, projectSizeBytes } = __require("project");
     const { makePaletteStrip, upscaleImage, encodePNG, buildExportFilename, buildPaletteFilename, buildProjectFilename, sanitizeBaseName } = __require("exporter");
     const { normalizeHex, parseHexPalette, formatHexPalette, clamp } = __require("color");
-    const { applyAspectLock, aspectLabel, buildExportMeta, defaultClipboardName, formatBytes, formatPercent, rangeProgress } = __require("uistate");
+    const { applyAspectLock, aspectLabel, buildExportMeta, clampZoom, computeFrame, defaultClipboardName, fitZoom, formatBytes, formatPercent, formatZoomPercent, parseZoomInput, rangeProgress, sliderToZoom, stepZoom, wheelZoomFactor, zoomAroundPoint, zoomPercent, zoomShortcut, zoomToSlider } = __require("uistate");
 
     const MAX_UNDO = 50;
     const LARGE_PROJECT_BYTES = 8 * 1024 * 1024;
@@ -1998,6 +2303,9 @@
     let outputImageData = null;
     let lastTimings = { resample: 0, quantize: 0, compose: 0, total: 0 };
     let outputTimer = null;
+    // 滚轮缩放按帧合并：同一帧内的多个 wheel 事件只重绘 / 重建一次。
+    let pendingWheelZoom = null;
+    let wheelZoomQueued = false;
 
     /* ---------- 工具函数 ---------- */
 
@@ -2096,7 +2404,8 @@
     function cacheElements() {
       const ids = [
         'btnImport', 'btnOpenProject', 'btnSaveProject', 'topDot', 'topStatus',
-        'outW', 'outH', 'lockAspect', 'aspectLabel', 'zoomRange', 'zoomValue',
+        'outW', 'outH', 'lockAspect', 'aspectLabel', 'zoomRange', 'zoomInput',
+        'btnZoomOut', 'btnZoomIn', 'btnZoomFit', 'btnZoomActual',
         'btnResetCrop', 'resampleSelect', 'resampleDesc', 'thresholdGroup',
         'targetGroup', 'thresholdRange', 'thresholdValue', 'targetColors',
         'ditherToggle', 'colorCount', 'approxState', 'btnUndoRecolor',
@@ -2125,23 +2434,19 @@
 
     function setupObservers() {
       if (typeof ResizeObserver === 'function') {
-        const observer = new ResizeObserver(() => {
-          if (sourceDrawQueued) return;
-          sourceDrawQueued = true;
-          requestAnimationFrame(() => {
-            sourceDrawQueued = false;
-            drawSourcePreview();
-          });
-        });
+        const observer = new ResizeObserver(() => scheduleSourceDraw());
         observer.observe(el.sourceWrap);
       }
-      window.addEventListener('resize', () => {
-        if (sourceDrawQueued) return;
-        sourceDrawQueued = true;
-        requestAnimationFrame(() => {
-          sourceDrawQueued = false;
-          drawSourcePreview();
-        });
+      window.addEventListener('resize', scheduleSourceDraw);
+    }
+
+    /** 源图预览重绘按帧合并：滚轮连续滚动时每帧只画一次。 */
+    function scheduleSourceDraw() {
+      if (sourceDrawQueued) return;
+      sourceDrawQueued = true;
+      requestAnimationFrame(() => {
+        sourceDrawQueued = false;
+        drawSourcePreview();
       });
     }
 
@@ -2160,6 +2465,10 @@
       el.btnUndoRecolor.addEventListener('click', undoRecolor);
       el.btnResetRecolor.addEventListener('click', resetRecolor);
       el.btnResetCrop.addEventListener('click', resetCrop);
+      el.btnZoomIn.addEventListener('click', (event) => nudgeZoom(1, event.shiftKey));
+      el.btnZoomOut.addEventListener('click', (event) => nudgeZoom(-1, event.shiftKey));
+      el.btnZoomFit.addEventListener('click', fitSourceToView);
+      el.btnZoomActual.addEventListener('click', resetZoomOneToOne);
 
       el.fileImage.addEventListener('change', () => {
         const file = el.fileImage.files?.[0];
@@ -2190,24 +2499,22 @@
 
       el.zoomRange.addEventListener('input', () => {
         if (!state.source) return;
-        const scale = clampScale(Number(el.zoomRange.value) / 100);
-        state.transform.scale = scale;
-        const constrained = constrainTransform(
-          state.source.width,
-          state.source.height,
-          state.transform.outputWidth,
-          state.transform.outputHeight,
-          scale,
-          state.transform.offsetX,
-          state.transform.offsetY,
-        );
-        Object.assign(state.transform, constrained);
-        syncZoomControls();
-        updateSourceInfo();
-        drawSourcePreview();
-        markDirty();
-        scheduleRebuild(true);
+        applySourceZoom(sliderToZoom(el.zoomRange.value));
       });
+
+      el.zoomInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          commitZoomInput();
+          el.zoomInput.blur();
+        } else if (event.key === 'Escape') {
+          event.preventDefault();
+          el.zoomInput.value = formatZoomPercent(state.transform.scale);
+          el.zoomInput.blur();
+        }
+      });
+      el.zoomInput.addEventListener('blur', commitZoomInput);
+      el.zoomInput.addEventListener('focus', () => el.zoomInput.select());
 
       el.resampleSelect.addEventListener('change', () => {
         state.resample = isValidResample(el.resampleSelect.value) ? el.resampleSelect.value : 'nearest';
@@ -2548,12 +2855,14 @@
         baseName: sanitizeBaseName(project.sourceName),
       };
 
+      // 缩放百分比以 ui.sourceZoom 为准（旧工程会由 transform.scale 推导）。
+      const restoredScale = clampZoom(project.ui.sourceZoom / 100);
       const constrained = constrainTransform(
         imageData.width,
         imageData.height,
         project.transform.outputWidth,
         project.transform.outputHeight,
-        project.transform.scale,
+        restoredScale,
         project.transform.offsetX,
         project.transform.offsetY,
       );
@@ -2621,21 +2930,7 @@
       const crop = currentCrop();
       if (!crop) return null;
       const aspect = state.transform.outputWidth / state.transform.outputHeight;
-      const padding = 28;
-      const availableW = Math.max(40, width - padding * 2);
-      const availableH = Math.max(40, height - padding * 2);
-      let frameWidth = Math.min(availableW, availableH * aspect);
-      let frameHeight = frameWidth / aspect;
-      if (frameHeight > availableH) {
-        frameHeight = availableH;
-        frameWidth = frameHeight * aspect;
-      }
-      const frame = {
-        x: (width - frameWidth) / 2,
-        y: (height - frameHeight) / 2,
-        width: frameWidth,
-        height: frameHeight,
-      };
+      const frame = computeFrame(width, height, aspect);
       const viewScale = frame.width / crop.width;
       const imageX = frame.x + frame.width / 2 - (crop.x + crop.width / 2) * viewScale;
       const imageY = frame.y + frame.height / 2 - (crop.y + crop.height / 2) * viewScale;
@@ -2807,63 +3102,134 @@
     function onWheel(event) {
       if (!state.source) return;
       event.preventDefault();
+      // 万一百分比输入框还在编辑，先失焦提交，避免旧文本在之后覆盖滚轮结果。
+      if (document.activeElement === el.zoomInput) el.zoomInput.blur();
+      const rect = el.sourceCanvas.getBoundingClientRect();
+      const pointerX = event.clientX - rect.left;
+      const pointerY = event.clientY - rect.top;
+      if (pointerX < 0 || pointerY < 0 || pointerX > rect.width || pointerY > rect.height) return;
+
+      const factor = wheelZoomFactor(event.deltaY, { shift: event.shiftKey });
+      if (factor === 1) return;
+
+      // 同一帧内累计滚轮因子，只做一次锚点缩放与重绘。
+      if (pendingWheelZoom) {
+        pendingWheelZoom.factor *= factor;
+        pendingWheelZoom.pointerX = pointerX;
+        pendingWheelZoom.pointerY = pointerY;
+      } else {
+        pendingWheelZoom = { factor, pointerX, pointerY };
+      }
+      if (wheelZoomQueued) return;
+      wheelZoomQueued = true;
+      requestAnimationFrame(flushWheelZoom);
+    }
+
+    function flushWheelZoom() {
+      wheelZoomQueued = false;
+      const pending = pendingWheelZoom;
+      pendingWheelZoom = null;
+      if (!pending || !state.source) return;
+
       const view = getSourceView();
       if (!view) return;
-      const rect = el.sourceCanvas.getBoundingClientRect();
-      const mouseX = event.clientX - rect.left;
-      const mouseY = event.clientY - rect.top;
-      if (mouseX < 0 || mouseY < 0 || mouseX > rect.width || mouseY > rect.height) return;
+      const target = clampZoom(state.transform.scale * pending.factor);
+      if (Math.abs(target - state.transform.scale) < 1e-6) {
+        // 已到 10% / 1600% 边界：只同步显示，避免控件与实际值脱节。
+        syncZoomControls();
+        return;
+      }
 
-      const oldScale = state.transform.scale;
-      const factor = Math.exp(-event.deltaY * 0.0014);
-      const newScale = clampScale(oldScale * factor);
-      if (Math.abs(newScale - oldScale) < 1e-4) return;
+      const next = zoomAroundPoint({
+        sourceWidth: state.source.width,
+        sourceHeight: state.source.height,
+        outputWidth: state.transform.outputWidth,
+        outputHeight: state.transform.outputHeight,
+        scale: state.transform.scale,
+        offsetX: state.transform.offsetX,
+        offsetY: state.transform.offsetY,
+        newScale: target,
+        pointerX: pending.pointerX,
+        pointerY: pending.pointerY,
+        frame: view.frame,
+      });
+      applyZoomTransform(next);
+    }
 
-      const crop = view.crop;
-      const imageX = crop.x + (mouseX - view.frame.x) / view.viewScale;
-      const imageY = crop.y + (mouseY - view.frame.y) / view.viewScale;
-      const newCrop = computeCropRect(
-        state.source.width,
-        state.source.height,
-        state.transform.outputWidth,
-        state.transform.outputHeight,
-        newScale,
-        0,
-        0,
-      );
-      const newViewScale = view.frame.width / newCrop.width;
-      const frameCenterX = view.frame.x + view.frame.width / 2;
-      const frameCenterY = view.frame.y + view.frame.height / 2;
-      const newCenterX = imageX - (mouseX - frameCenterX) / newViewScale;
-      const newCenterY = imageY - (mouseY - frameCenterY) / newViewScale;
+    /* ---------- 缩放控制 ---------- */
 
+    /** 应用缩放结果：同步控件、按帧重绘预览与结果。 */
+    function applyZoomTransform(transform) {
+      Object.assign(state.transform, transform);
+      syncZoomControls();
+      markDirty();
+      scheduleSourceDraw();
+      scheduleRebuild(true);
+    }
+
+    /** 以当前裁切中心为基准设置缩放（滑块 / 百分比输入 / 快捷键共用）。 */
+    function applySourceZoom(scale, offsetX = state.transform.offsetX, offsetY = state.transform.offsetY) {
+      if (!state.source) return;
       const constrained = constrainTransform(
         state.source.width,
         state.source.height,
         state.transform.outputWidth,
         state.transform.outputHeight,
-        newScale,
-        newCenterX - state.source.width / 2,
-        newCenterY - state.source.height / 2,
+        clampZoom(scale),
+        offsetX,
+        offsetY,
       );
-      Object.assign(state.transform, constrained);
-      syncZoomControls();
-      markDirty();
-      updateSourceInfo();
-      drawSourcePreview();
-      scheduleRebuild(true);
+      applyZoomTransform(constrained);
     }
 
+    /** -/+ 微调：direction > 0 放大；Shift（fine）时步长从 1.02 变 1.005。 */
+    function nudgeZoom(direction, fine = false) {
+      if (!state.source) return;
+      applySourceZoom(stepZoom(state.transform.scale, direction, fine));
+    }
+
+    /** 百分比输入框：回车或失焦时解析，非法输入回退到当前值。 */
+    function commitZoomInput() {
+      if (!el.zoomInput) return;
+      const next = parseZoomInput(el.zoomInput.value, state.transform.scale);
+      el.zoomInput.value = formatZoomPercent(next);
+      if (!state.source) return;
+      if (Math.abs(next - state.transform.scale) > 1e-9) applySourceZoom(next);
+    }
+
+    /** 1:1：回到 100%，保留当前裁切中心。 */
+    function resetZoomOneToOne() {
+      if (!state.source) return;
+      applySourceZoom(1);
+    }
+
+    /** 适应窗口：让整张源图落入预览区并居中。 */
+    function fitSourceToView() {
+      if (!state.source) return;
+      const rect = el.sourceWrap.getBoundingClientRect();
+      const scale = fitZoom(
+        state.source.width,
+        state.source.height,
+        state.transform.outputWidth,
+        state.transform.outputHeight,
+        rect.width,
+        rect.height,
+      );
+      applySourceZoom(scale, 0, 0);
+    }
+
+    /** 键盘 + / - / 0 / f 的实际动作。 */
+    function runZoomShortcut(action) {
+      if (action === 'zoom-in') nudgeZoom(1);
+      else if (action === 'zoom-out') nudgeZoom(-1);
+      else if (action === 'reset') resetZoomOneToOne();
+      else if (action === 'fit') fitSourceToView();
+    }
+
+    /** 重置裁切：100% 缩放并居中。 */
     function resetCrop() {
       if (!state.source) return;
-      state.transform.scale = 1;
-      state.transform.offsetX = 0;
-      state.transform.offsetY = 0;
-      syncZoomControls();
-      markDirty();
-      updateSourceInfo();
-      drawSourcePreview();
-      scheduleRebuild(true);
+      applySourceZoom(1, 0, 0);
     }
 
     /* ---------- 重建管线 ---------- */
@@ -3162,7 +3528,7 @@
       const t = state.transform;
       el.srcInfoBadge.textContent = `${state.source.width}×${state.source.height}`;
       el.srcDims.textContent = `源图 ${state.source.width} × ${state.source.height} px`;
-      el.srcZoom.textContent = `缩放 ${Math.round(t.scale * 100)}%`;
+      el.srcZoom.textContent = `缩放 ${formatZoomPercent(t.scale)}`;
       el.srcOffset.textContent = `偏移 ${t.offsetX.toFixed(1)}, ${t.offsetY.toFixed(1)}`;
       if (crop) {
         el.srcCrop.textContent = `裁切 ${crop.width.toFixed(1)} × ${crop.height.toFixed(1)} @ (${crop.x.toFixed(1)}, ${crop.y.toFixed(1)})`;
@@ -3329,10 +3695,14 @@
     }
 
     function syncZoomControls() {
-      const percent = Math.round(state.transform.scale * 100);
-      el.zoomRange.value = String(clamp(percent, 10, 1600));
-      el.zoomValue.textContent = `${percent}%`;
-      timelineValue(el.zoomRange, percent);
+      const scale = state.transform.scale;
+      const sliderValue = Math.round(zoomToSlider(scale));
+      el.zoomRange.value = String(sliderValue);
+      timelineValue(el.zoomRange, sliderValue);
+      // 用户正在输入百分比时不要覆盖输入框内容。
+      if (el.zoomInput && document.activeElement !== el.zoomInput) {
+        el.zoomInput.value = formatZoomPercent(scale);
+      }
       updateSourceInfo();
     }
 
@@ -3489,6 +3859,8 @@
           resultZoom: state.resultZoom,
           lockAspect: state.lockAspect,
           exportScale: state.exportScale,
+          // 源图缩放百分比：恢复时优先使用，旧工程缺省时由 transform.scale 推导。
+          sourceZoom: Math.round(zoomPercent(state.transform.scale) * 100) / 100,
         },
       }, {
         createdAt: state.createdAt,
@@ -3576,11 +3948,20 @@
     }
 
     function onKeyDown(event) {
-      const modifier = event.ctrlKey || event.metaKey;
-      if (!modifier) return;
       const target = event.target;
       const editing = target instanceof HTMLElement
         && (target.matches('input, textarea, select') || target.isContentEditable);
+      const modifier = event.ctrlKey || event.metaKey;
+
+      // 无修饰键的缩放快捷键：+ / - / 0 / f（输入框聚焦时不触发）。
+      if (!modifier) {
+        const action = zoomShortcut(event, editing);
+        if (!action) return;
+        event.preventDefault();
+        runZoomShortcut(action);
+        return;
+      }
+
       const key = event.key.toLowerCase();
 
       if (key === 's') {
@@ -3677,6 +4058,14 @@
           drawSourcePreview();
           markDirty();
           rebuildPipeline();
+          return getDebugState();
+        },
+        setSourceZoom(percent) {
+          applySourceZoom(clampZoom(Number(percent) / 100));
+          return getDebugState();
+        },
+        zoomToFit() {
+          fitSourceToView();
           return getDebugState();
         },
         setPaletteColor(sourceHex, targetHex) {
