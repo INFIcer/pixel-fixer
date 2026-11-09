@@ -1,0 +1,12 @@
+{
+  "name": "pixel-fixer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "纯前端像素画修复工具：裁切、重采样、色阶简化、改色、导出与工程文件。",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "build:standalone": "node tools/build-standalone.js",
+    "serve": "python -m http.server 8123"
+  }
+}

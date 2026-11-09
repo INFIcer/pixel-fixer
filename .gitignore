@@ -1,0 +1,17 @@
+# 浏览器自动化 / 临时验证产物
+.edge-*/
+*.edge-*
+.edge-*
+edge-*.txt
+shot-*.png
+module-test*
+.downloads/
+
+# 依赖与构建缓存
+node_modules/
+npm-debug.log*
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini

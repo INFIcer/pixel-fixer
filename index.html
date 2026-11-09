@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0f14">
+  <meta name="description" content="本地运行的像素画后期修复工具：裁切、重采样、色阶简化、改色与导出。">
+  <title>像素画修复工具 · PIXFIX</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230b0f14'/%3E%3Crect x='6' y='6' width='8' height='8' fill='%232dd4bf'/%3E%3Crect x='18' y='6' width='8' height='8' fill='%2338bdf8'/%3E%3Crect x='6' y='18' width='8' height='8' fill='%23fbbf24'/%3E%3Crect x='18' y='18' width='8' height='8' fill='%23f472b6'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+          <rect x="1" y="1" width="30" height="30" rx="7" fill="#111a24" stroke="#2b3a4b"></rect>
+          <rect x="6" y="6" width="9" height="9" fill="#2dd4bf"></rect>
+          <rect x="17" y="6" width="9" height="9" fill="#38bdf8"></rect>
+          <rect x="6" y="17" width="9" height="9" fill="#fbbf24"></rect>
+          <rect x="17" y="17" width="9" height="9" fill="#f472b6"></rect>
+        </svg>
+        <div class="brand-copy">
+          <h1>像素画修复工具</h1>
+          <p>PIXFIX <span>·</span> 本地像素后期工作台</p>
+        </div>
+      </div>
+
+      <div class="top-actions">
+        <button type="button" id="btnImport" class="btn btn-accent">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v9m0-9 3.5 3.5M10 3 6.5 6.5M4 12v4h12v-4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          导入图片
+        </button>
+        <button type="button" id="btnOpenProject" class="btn">打开工程</button>
+        <button type="button" id="btnSaveProject" class="btn">保存工程</button>
+      </div>
+
+      <div class="top-state">
+        <span class="pulse-dot" id="topDot"></span>
+        <span id="topStatus">等待导入</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="panel controls-panel" aria-label="参数面板">
+        <div class="panel-scroll">
+          <section class="control-section">
+            <div class="section-heading">
+              <div>
+                <span class="kicker">FRAME</span>
+                <h2>画面与裁切</h2>
+              </div>
+              <span class="section-index">01</span>
+            </div>
+
+            <div class="dimension-row">
+              <label class="field field-inline">
+                <span>宽度</span>
+                <span class="number-wrap"><input id="outW" type="number" min="8" max="512" step="1" value="64" inputmode="numeric"><em>px</em></span>
+              </label>
+              <span class="dimension-x">×</span>
+              <label class="field field-inline">
+                <span>高度</span>
+                <span class="number-wrap"><input id="outH" type="number" min="8" max="512" step="1" value="64" inputmode="numeric"><em>px</em></span>
+              </label>
+            </div>
+            <label class="check-line">
+              <input id="lockAspect" type="checkbox" checked>
+              <span>锁定宽高比</span>
+              <small id="aspectLabel">1 : 1</small>
+            </label>
+
+            <div class="field-block">
+              <div class="field-header">
+                <span>源图缩放</span>
+                <output id="zoomValue" class="value-chip" for="zoomRange">100%</output>
+              </div>
+              <input id="zoomRange" class="range" type="range" min="10" max="1600" step="5" value="100">
+              <div class="range-scale"><span>10%</span><span>1600%</span></div>
+            </div>
+
+            <div class="inline-actions">
+              <button type="button" id="btnResetCrop" class="btn btn-small">重置裁切</button>
+              <span class="hint">拖拽平移 · 滚轮缩放</span>
+            </div>
+          </section>
+
+          <section class="control-section">
+            <div class="section-heading">
+              <div>
+                <span class="kicker">RESAMPLE</span>
+                <h2>重采样</h2>
+              </div>
+              <span class="section-index">02</span>
+            </div>
+            <label class="field">
+              <span>算法</span>
+              <select id="resampleSelect"></select>
+            </label>
+            <p class="hint hint-block" id="resampleDesc">直接取最近源像素，不产生新颜色。适合已经对齐的像素画。</p>
+          </section>
+
+          <section class="control-section">
+            <div class="section-heading">
+              <div>
+                <span class="kicker">COLOR</span>
+                <h2>色阶简化</h2>
+              </div>
+              <span class="section-index">03</span>
+            </div>
+
+            <div class="segmented" role="group" aria-label="颜色模式">
+              <label><input type="radio" name="colorMode" value="threshold" checked><span>阈值合并</span></label>
+              <label><input type="radio" name="colorMode" value="target"><span>目标色数</span></label>
+            </div>
+
+            <div id="thresholdGroup" class="mode-group">
+              <div class="field-header">
+                <span>合并阈值</span>
+                <output id="thresholdValue" class="value-chip" for="thresholdRange">0</output>
+              </div>
+              <input id="thresholdRange" class="range" type="range" min="0" max="100" step="1" value="0">
+              <div class="range-scale"><span>0 · 不合并</span><span>100 · 最激进</span></div>
+              <p class="hint hint-block">CIELAB ΔE 距离小于阈值的颜色被合并；颜色数随阈值单调不增。</p>
+            </div>
+
+            <div id="targetGroup" class="mode-group is-hidden">
+              <label class="field field-inline">
+                <span>目标颜色数</span>
+                <span class="number-wrap number-wrap-short"><input id="targetColors" type="number" min="2" max="256" step="1" value="16" inputmode="numeric"><em>色</em></span>
+              </label>
+              <p class="hint hint-block">在 CIELAB 空间执行带权 k-means++，自动寻找合适的 N 色。</p>
+            </div>
+
+            <label class="check-line">
+              <input id="ditherToggle" type="checkbox">
+              <span>Floyd–Steinberg 抖动</span>
+              <small>默认关</small>
+            </label>
+
+            <div class="mini-stats">
+              <div><strong id="colorCount">0</strong><span>最终颜色</span></div>
+              <div><strong id="approxState">精确</strong><span>量化模式</span></div>
+            </div>
+
+            <div class="inline-actions">
+              <button type="button" id="btnUndoRecolor" class="btn btn-small" disabled>撤销改色</button>
+              <button type="button" id="btnResetRecolor" class="btn btn-small" disabled>还原自动色</button>
+            </div>
+          </section>
+
+          <section class="control-section">
+            <div class="section-heading">
+              <div>
+                <span class="kicker">EXPORT</span>
+                <h2>导出</h2>
+              </div>
+              <span class="section-index">04</span>
+            </div>
+
+            <label class="field field-inline">
+              <span>放大倍数</span>
+              <select id="exportScale" class="select-short">
+                <option value="1">1× 原尺寸</option>
+                <option value="2">2×</option>
+                <option value="4">4×</option>
+                <option value="8">8×</option>
+                <option value="16">16×</option>
+              </select>
+            </label>
+            <div class="export-meta">
+              <div><span>文件名</span><code id="exportFilename">—</code></div>
+              <div><span>最终统计</span><code id="exportStats">—</code></div>
+            </div>
+            <div class="export-buttons">
+              <button type="button" id="btnExportPng" class="btn btn-accent">导出 PNG</button>
+              <button type="button" id="btnExportPalette" class="btn">调色盘 PNG</button>
+            </div>
+            <p class="hint hint-block">PNG 使用最近邻放大，像素边缘保持锐利。工程文件请用顶部“保存工程”。</p>
+          </section>
+        </div>
+      </aside>
+
+      <section class="center-stage" aria-label="预览">
+        <section class="preview-panel source-panel">
+          <header class="preview-heading">
+            <div>
+              <span class="kicker">SOURCE</span>
+              <h2>源图预览</h2>
+            </div>
+            <div class="preview-heading-right">
+              <span class="tag" id="srcInfoBadge">未导入</span>
+              <span class="preview-tip">青色框 = 输出裁切范围</span>
+            </div>
+          </header>
+          <div class="canvas-stage" id="sourceWrap">
+            <canvas id="sourceCanvas" class="source-canvas" aria-label="源图裁切预览"></canvas>
+            <div class="preview-empty" id="sourceEmpty">
+              <div class="empty-art" aria-hidden="true">
+                <span></span><span></span><span></span><span></span>
+              </div>
+              <h3>拖入一张图片开始</h3>
+              <p>也可以按 <kbd>Ctrl</kbd> + <kbd>V</kbd> 粘贴剪贴板图片</p>
+              <div class="empty-actions">
+                <button type="button" class="btn btn-small btn-accent" id="btnEmptyImport">选择图片</button>
+                <button type="button" class="btn btn-small" id="btnEmptyProject">打开工程</button>
+              </div>
+            </div>
+            <div class="canvas-hud">拖拽平移 · 滚轮缩放 · 框内为导出范围</div>
+          </div>
+          <footer class="preview-footer">
+            <span id="srcDims">源图 —</span>
+            <span id="srcZoom">缩放 100%</span>
+            <span id="srcOffset">偏移 0.0, 0.0</span>
+            <span id="srcCrop">裁切 —</span>
+          </footer>
+        </section>
+
+        <section class="preview-panel result-panel">
+          <header class="preview-heading">
+            <div>
+              <span class="kicker">RESULT</span>
+              <h2>结果预览</h2>
+            </div>
+            <div class="preview-heading-right">
+              <div class="zoom-group" id="resultZoomGroup" role="group" aria-label="结果放大倍数">
+                <button type="button" data-zoom="1">1×</button>
+                <button type="button" data-zoom="4" class="is-active">4×</button>
+                <button type="button" data-zoom="8">8×</button>
+              </div>
+              <span class="preview-tip" id="resultTip">最近邻放大显示</span>
+            </div>
+          </header>
+          <div class="result-scroll" id="resultScroll">
+            <div class="result-inner">
+              <canvas id="resultCanvas" class="result-canvas checkerboard" aria-label="修复结果预览"></canvas>
+              <div class="preview-empty" id="resultEmpty">
+                <div class="empty-pixels" aria-hidden="true">····<br>····<br>····</div>
+                <h3>结果会显示在这里</h3>
+                <p>先导入图片，再调整裁切、重采样与颜色。</p>
+              </div>
+            </div>
+          </div>
+          <footer class="preview-footer">
+            <span id="outDims">输出 64 × 64</span>
+            <span id="outCrop">裁切 —</span>
+            <span id="pixelCount">4096 像素</span>
+            <span id="resultColors">0 色</span>
+          </footer>
+        </section>
+      </section>
+
+      <aside class="panel palette-panel" aria-label="调色盘">
+        <div class="palette-head">
+          <div>
+            <span class="kicker">PALETTE</span>
+            <h2>调色盘</h2>
+          </div>
+          <span class="badge" id="paletteCount">0 色</span>
+        </div>
+        <div class="palette-tools">
+          <button type="button" id="btnImportHex" class="btn btn-small">导入 HEX</button>
+          <button type="button" id="btnExportHex" class="btn btn-small">导出 HEX</button>
+        </div>
+        <div class="palette-legend">
+          <span>点击色块改色 · 全图重映射</span>
+          <span id="paletteHint">自动聚类</span>
+        </div>
+        <div class="palette-list" id="paletteList"></div>
+        <div class="palette-empty" id="paletteEmpty">
+          <svg viewBox="0 0 48 48" aria-hidden="true">
+            <rect x="6" y="6" width="16" height="16" rx="3"></rect>
+            <rect x="26" y="6" width="16" height="16" rx="3"></rect>
+            <rect x="6" y="26" width="16" height="16" rx="3"></rect>
+            <rect x="26" y="26" width="16" height="16" rx="3"></rect>
+          </svg>
+          <p>导入图片后，这里会列出最终颜色、HEX 与像素占比。</p>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="statusbar">
+      <span class="status-main"><span class="status-dot"></span><span id="statusText">就绪，等待导入</span></span>
+      <span class="status-separator">/</span>
+      <span id="timingText">尚无计算</span>
+      <span class="status-spacer"></span>
+      <span id="projectState">未命名工作</span>
+      <span class="status-separator">/</span>
+      <span class="privacy">纯本地处理 · 不上传</span>
+    </footer>
+  </div>
+
+  <div class="drop-overlay" id="dropOverlay">
+    <div class="drop-card">
+      <strong>松手导入</strong>
+      <span>支持图片，或 .pixfix.json 工程文件</span>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <input type="file" id="fileImage" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,image/avif" hidden>
+  <input type="file" id="fileProject" accept=".json,.pixfix.json,application/json" hidden>
+  <input type="file" id="fileHex" accept=".hex,.txt,text/plain" hidden>
+  <input type="color" id="colorPicker" class="visually-hidden" tabindex="-1" aria-hidden="true">
+
+  <noscript>
+    <div class="noscript">此工具需要启用 JavaScript。</div>
+  </noscript>
+
+  <!--
+    本地 HTTP：加载真正的 ES module 入口 src/app.js。
+    file://：Chromium 会以 CORS 方式阻止模块跨文件加载，因此自动切换到由
+    tools/build-standalone.js 从同一套模块生成的经典脚本 src/standalone.js。
+    两条路径共享完全相同的算法与 UI 源码。
+  -->
+  <script type="module">
+    const bootFallback = (reason) => {
+      if (window.__PIXFIX_BOOTING_FALLBACK__) return;
+      window.__PIXFIX_BOOTING_FALLBACK__ = true;
+      if (reason) console.warn('[PIXFIX] ES module 加载失败，改用 file:// 兼容包。', reason);
+      const script = document.createElement('script');
+      script.src = './src/standalone.js';
+      script.onerror = () => {
+        document.getElementById('statusText').textContent = '启动失败：找不到 src/standalone.js';
+        document.getElementById('topStatus').textContent = '启动失败';
+      };
+      document.body.appendChild(script);
+    };
+
+    if (location.protocol === 'file:') {
+      bootFallback();
+    } else {
+      import('./src/app.js').catch((error) => {
+        console.error('[PIXFIX] 模块入口加载失败', error);
+        bootFallback(error);
+      });
+    }
+  </script>
+</body>
+</html>
