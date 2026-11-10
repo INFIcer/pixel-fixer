@@ -5,10 +5,15 @@ import {
   applyAspectLock,
   aspectLabel,
   buildExportMeta,
+  clampResultZoom,
   clampZoom,
   computeFrame,
   defaultClipboardName,
+  fitResultZoom,
   fitZoom,
+  formatResultZoom,
+  normalizeSplitMode,
+  parseResultZoomInput,
   formatBytes,
   formatPercent,
   formatZoomPercent,
@@ -19,8 +24,12 @@ import {
   percentToSlider,
   rangeProgress,
   resolveCropSizeEdit,
+  resolveSplitMode,
   restoreCropSizeSnapshot,
+  resultZoomFromPercent,
+  resultZoomToSlider,
   sliderToPercent,
+  sliderToResultZoom,
   sliderToZoom,
   stepCropSize,
   stepZoom,
@@ -370,4 +379,45 @@ test('裁切框几何与适应窗口', () => {
   // 方形 512 源图、64 输出：1/8 = 12.5%。
   assert.ok(Math.abs(fitZoom(512, 512, 64, 64) - 0.125) < 1e-9);
   assert.equal(fitZoom(0, 100, 64, 64), 1);
+});
+
+test('结果预览缩放：范围、百分比与输入解析', () => {
+  assert.equal(clampResultZoom(0.1), 0.25);
+  assert.equal(clampResultZoom(20), 8);
+  assert.equal(clampResultZoom(''), 1);
+  assert.equal(formatResultZoom(1), '100%');
+  assert.equal(formatResultZoom(0.25), '25%');
+  assert.equal(formatResultZoom(8), '800%');
+  assert.equal(resultZoomFromPercent(250), 2.5);
+  assert.equal(parseResultZoomInput('250%', 4), 2.5);
+  assert.equal(parseResultZoomInput(' 137.5 % ', 4), 1.375);
+  assert.equal(parseResultZoomInput('5', 4), 0.25);
+  assert.equal(parseResultZoomInput('', 4), 4);
+  assert.equal(parseResultZoomInput('abc', 4), 4);
+});
+
+test('结果预览缩放：对数滑块与适应窗口', () => {
+  for (const zoom of [0.25, 0.5, 1, 2, 4, 8]) {
+    const restored = sliderToResultZoom(resultZoomToSlider(zoom));
+    assert.ok(Math.abs(restored - zoom) < 1e-9, `${zoom} 往返`);
+  }
+  assert.equal(resultZoomToSlider(0.25), 0);
+  assert.equal(resultZoomToSlider(8), 1000);
+  assert.equal(sliderToResultZoom(0), 0.25);
+  assert.equal(sliderToResultZoom(1000), 8);
+  assert.equal(fitResultZoom(64, 64, 800, 600), 8);
+  assert.ok(Math.abs(fitResultZoom(512, 512, 800, 600) - 536 / 512) < 1e-9);
+  assert.equal(fitResultZoom(0, 64, 800, 600), 1);
+  assert.equal(fitResultZoom(64, 64, 20, 20), 1);
+});
+
+test('分割模式：宽度不足时左右退化为上下', () => {
+  assert.equal(normalizeSplitMode('stack'), 'stack');
+  assert.equal(normalizeSplitMode('anything'), 'side');
+  assert.equal(resolveSplitMode('side', 900), 'side');
+  assert.equal(resolveSplitMode('side', 759), 'stack');
+  assert.equal(resolveSplitMode('side', 760), 'side');
+  assert.equal(resolveSplitMode('stack', 1200), 'stack');
+  assert.equal(resolveSplitMode('side', NaN), 'side');
+  assert.equal(resolveSplitMode('side', 600, 500), 'side');
 });

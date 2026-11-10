@@ -1694,6 +1694,7 @@
 
     const { normalizeHex } = __require("color");
     const { isValidResample } = __require("resample");
+    const { clampResultZoom, normalizeSplitMode } = __require("uistate");
 
     const PROJECT_VERSION = 1;
 
@@ -1765,10 +1766,12 @@
       const zoom = Number(ui.resultZoom);
       const exportScale = Number(ui.exportScale);
       return {
-        resultZoom: [1, 4, 8].includes(zoom) ? zoom : 4,
+        // 结果预览倍率：0.25~8 连续，旧工程的 1/4/8 档位照常兼容。
+        resultZoom: clampResultZoom(Number.isFinite(zoom) ? zoom : 4),
+        splitMode: normalizeSplitMode(ui.splitMode),
         lockAspect: Boolean(ui.lockAspect),
         exportScale: [1, 2, 4, 8, 16].includes(exportScale) ? exportScale : 1,
-        // 源图缩放百分比（10~1600）：与 transform.scale 对应，便于阅读与恢复。
+        // 源图缩放百分比（1~6400）：与 transform.scale 对应，便于阅读与恢复。
         sourceZoom: zoomPercentValue(ui.sourceZoom, fallbackScale),
         // 调色盘联动开关：只有明确写入 false 才关闭；旧工程缺省视为开启。
         hoverHighlight: ui.hoverHighlight !== false,
@@ -2354,7 +2357,7 @@
     /** 预览区留白，与 app.js 绘制裁切框时使用的边距一致。 */
     const ZOOM_FRAME_PADDING = 28;
 
-    /** 把缩放值夹到 10%~1600%；非法值回退到 100%。 */
+    /** 把缩放值夹到 1%~6400%；非法值回退到 100%。 */
     function clampZoom(scale) {
       return clampScale(scale);
     }
@@ -2382,7 +2385,7 @@
       return `${Math.round(percent)}%`;
     }
 
-    /** 百分比 → 缩放值（夹到 10%~1600%）。 */
+    /** 百分比 → 缩放值（夹到 1%~6400%）。 */
     function zoomFromPercent(percent) {
       const value = Number(percent);
       if (!Number.isFinite(value)) return 1;
@@ -2391,7 +2394,7 @@
 
     /**
      * 解析百分比输入框：允许 "137%"、"137"、" 137.5 % "，空值或非数字回退到 fallback。
-     * 越界值直接夹到 10%~1600%（例如 5000% → 1600%，0% → 10%）。
+     * 越界值直接夹到 1%~6400%（例如 10000% → 6400%，0% → 1%）。
      */
     function parseZoomInput(text, fallbackScale = 1) {
       const fallback = clampZoom(fallbackScale);
@@ -2429,6 +2432,97 @@
       return zoomFromPercent(sliderToPercent(value));
     }
 
+    /* ---------- 结果预览缩放：25%~800%，无级连续 ---------- */
+
+    /** 结果预览的显示倍率范围，与源图裁切缩放相互独立。 */
+    const RESULT_ZOOM_MIN = 0.25;
+    const RESULT_ZOOM_MAX = 8;
+    const RESULT_ZOOM_MIN_PERCENT = RESULT_ZOOM_MIN * 100;
+    const RESULT_ZOOM_MAX_PERCENT = RESULT_ZOOM_MAX * 100;
+    const RESULT_ZOOM_SLIDER_MAX = 1000;
+    const RESULT_ZOOM_PADDING = 32;
+
+    /** 把结果预览倍率夹到 25%~800%；非法值回退到 100%。 */
+    function clampResultZoom(zoom) {
+      if (zoom === '' || zoom === null || zoom === undefined) return 1;
+      const value = Number(zoom);
+      if (!Number.isFinite(value)) return 1;
+      return clamp(value, RESULT_ZOOM_MIN, RESULT_ZOOM_MAX);
+    }
+
+    /** 结果倍率 → 百分比展示，复用源图缩放的量级规则。 */
+    function formatResultZoom(zoom) {
+      return formatZoomPercent(clampResultZoom(zoom));
+    }
+
+    /** 百分比 → 结果倍率。 */
+    function resultZoomFromPercent(percent) {
+      return clampResultZoom(Number(percent) / 100);
+    }
+
+    /** 解析结果预览的百分比输入，允许 "137%"、"137"、" 137.5 % "。 */
+    function parseResultZoomInput(text, fallbackZoom = 1) {
+      const fallback = clampResultZoom(fallbackZoom);
+      const raw = String(text ?? '').replace(/[%\s]/g, '').replace(',', '.');
+      if (!raw) return fallback;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return fallback;
+      return resultZoomFromPercent(value);
+    }
+
+    /** 结果倍率 → 对数滑块位置（0~1000）。 */
+    function resultZoomToSlider(zoom) {
+      const percent = clampResultZoom(zoom) * 100;
+      const ratio = Math.log(percent / RESULT_ZOOM_MIN_PERCENT)
+        / Math.log(RESULT_ZOOM_MAX_PERCENT / RESULT_ZOOM_MIN_PERCENT);
+      return clamp(ratio * RESULT_ZOOM_SLIDER_MAX, 0, RESULT_ZOOM_SLIDER_MAX);
+    }
+
+    /** 对数滑块位置 → 结果倍率。 */
+    function sliderToResultZoom(value) {
+      const numeric = Number(value);
+      const safe = Number.isFinite(numeric) ? numeric : 0;
+      const ratio = clamp(safe, 0, RESULT_ZOOM_SLIDER_MAX) / RESULT_ZOOM_SLIDER_MAX;
+      const percent = RESULT_ZOOM_MIN_PERCENT
+        * (RESULT_ZOOM_MAX_PERCENT / RESULT_ZOOM_MIN_PERCENT) ** ratio;
+      return resultZoomFromPercent(percent);
+    }
+
+    /** 结果画面适应窗口：按可用视口与输出尺寸求倍率。 */
+    function fitResultZoom(outputWidth, outputHeight, viewportWidth, viewportHeight, padding = RESULT_ZOOM_PADDING) {
+      const ow = Number(outputWidth);
+      const oh = Number(outputHeight);
+      const vw = Number(viewportWidth);
+      const vh = Number(viewportHeight);
+      const pad = Math.max(0, Number(padding) || 0);
+      if (!(ow > 0) || !(oh > 0) || !(vw > 0) || !(vh > 0)) return 1;
+      const availableW = vw - pad * 2;
+      const availableH = vh - pad * 2;
+      if (!(availableW > 0) || !(availableH > 0)) return 1;
+      return clampResultZoom(Math.min(availableW / ow, availableH / oh));
+    }
+
+    /* ---------- 预览分割模式 ---------- */
+
+    const SPLIT_MODES = ['side', 'stack'];
+    /** 中心预览窄于该宽度时，左右分割会挤成两条细缝，自动改为上下。 */
+    const SPLIT_MIN_WIDTH = 760;
+
+    function normalizeSplitMode(value) {
+      return value === 'stack' ? 'stack' : 'side';
+    }
+
+    /**
+     * 实际生效的分割方式：用户选左右但视口不够宽时退化为上下；
+     * 用户主动选上下时始终保持上下。
+     */
+    function resolveSplitMode(requested, viewportWidth, minWidth = SPLIT_MIN_WIDTH) {
+      const mode = normalizeSplitMode(requested);
+      const width = Number(viewportWidth);
+      if (mode === 'side' && Number.isFinite(width) && width < minWidth) return 'stack';
+      return mode;
+    }
+
     /**
      * 滚轮缩放因子：factor = exp(-deltaY * 0.0015 * (shift ? 0.25 : 1))。
      * 连续指数缩放不会在挡位之间跳变；无效 deltaY 返回 1（不动）。
@@ -2446,7 +2540,7 @@
     }
 
     /**
-     * 单次 +/- 微调。direction > 0 放大，< 0 缩小；结果夹在 10%~1600%。
+     * 单次 +/- 微调。direction > 0 放大，< 0 缩小；结果夹在 1%~6400%。
      * @param {number} scale 当前缩放
      * @param {number} direction 方向（通常为 +1 / -1）
      * @param {boolean} [fine] 是否精调（Shift）
@@ -2602,7 +2696,110 @@
       );
     }
 
-    Object.assign(__exports, { gcd, aspectLabel, formatBytes, formatPercent, CROP_SIZE_MIN, CROP_SIZE_MAX, parseCropSizeInput, normalizeCropSize, resolveCropSizeEdit, restoreCropSizeSnapshot, stepCropSize, applyAspectLock, buildExportMeta, defaultClipboardName, rangeProgress, ZOOM_MIN, ZOOM_MAX, ZOOM_MIN_PERCENT, ZOOM_MAX_PERCENT, ZOOM_SLIDER_MAX, ZOOM_STEP, ZOOM_STEP_FINE, WHEEL_ZOOM_SENSITIVITY, WHEEL_ZOOM_FINE, ZOOM_FRAME_PADDING, clampZoom, zoomPercent, formatZoomPercent, zoomFromPercent, parseZoomInput, percentToSlider, sliderToPercent, zoomToSlider, sliderToZoom, wheelZoomFactor, zoomStepFactor, stepZoom, zoomShortcut, computeFrame, fitZoom, zoomAroundPoint });
+    Object.assign(__exports, { gcd, aspectLabel, formatBytes, formatPercent, CROP_SIZE_MIN, CROP_SIZE_MAX, parseCropSizeInput, normalizeCropSize, resolveCropSizeEdit, restoreCropSizeSnapshot, stepCropSize, applyAspectLock, buildExportMeta, defaultClipboardName, rangeProgress, ZOOM_MIN, ZOOM_MAX, ZOOM_MIN_PERCENT, ZOOM_MAX_PERCENT, ZOOM_SLIDER_MAX, ZOOM_STEP, ZOOM_STEP_FINE, WHEEL_ZOOM_SENSITIVITY, WHEEL_ZOOM_FINE, ZOOM_FRAME_PADDING, clampZoom, zoomPercent, formatZoomPercent, zoomFromPercent, parseZoomInput, percentToSlider, sliderToPercent, zoomToSlider, sliderToZoom, RESULT_ZOOM_MIN, RESULT_ZOOM_MAX, RESULT_ZOOM_MIN_PERCENT, RESULT_ZOOM_MAX_PERCENT, RESULT_ZOOM_SLIDER_MAX, RESULT_ZOOM_PADDING, clampResultZoom, formatResultZoom, resultZoomFromPercent, parseResultZoomInput, resultZoomToSlider, sliderToResultZoom, fitResultZoom, SPLIT_MODES, SPLIT_MIN_WIDTH, normalizeSplitMode, resolveSplitMode, wheelZoomFactor, zoomStepFactor, stepZoom, zoomShortcut, computeFrame, fitZoom, zoomAroundPoint });
+  });
+
+  __define("history", function (__exports, __require) {
+    "use strict";
+    // 编辑历史：只管快照栈、容量与连续动作合并，不直接接触 DOM 或应用状态。
+    // 快照的深拷贝与“哪些字段算一次编辑”由调用方负责，便于单独测试合并规则。
+
+    const HISTORY_LIMIT = 50;
+
+    /**
+     * 创建一条编辑历史。
+     *
+     * 记录结构：{ id, label, before, after, coalesceKey, at }
+     * - before / after 是调用方生成的完整状态快照；
+     * - coalesceKey 相同且间隔在 windowMs 内的新记录，只更新上一条的 after；
+     * - undo/redo 用“当前状态”补齐另一侧快照，保证来回切换后仍然准确。
+     */
+    function createHistory({ limit = HISTORY_LIMIT } = {}) {
+      const capacity = Math.max(1, Math.floor(Number(limit) || HISTORY_LIMIT));
+      const past = [];
+      const future = [];
+      let sequence = 0;
+
+      function trim() {
+        while (past.length > capacity) past.shift();
+      }
+
+      function push(entry, options = {}) {
+        if (!entry || entry.before === undefined || entry.after === undefined) {
+          throw new Error('历史记录缺少快照');
+        }
+        const coalesceKey = options.coalesceKey || null;
+        const windowMs = Math.max(0, Number(options.windowMs) || 0);
+        const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+
+        // 从历史中间做了新编辑时，旧的“未来”已经失效。
+        const hadFuture = future.length > 0;
+        if (hadFuture) future.length = 0;
+
+        const last = past[past.length - 1];
+        if (
+          !hadFuture
+          && coalesceKey
+          && last
+          && last.coalesceKey === coalesceKey
+          && now - last.at <= windowMs
+        ) {
+          last.after = entry.after;
+          last.at = now;
+          if (entry.label) last.label = entry.label;
+          return last;
+        }
+
+        const record = {
+          id: ++sequence,
+          label: entry.label || '编辑',
+          before: entry.before,
+          after: entry.after,
+          coalesceKey,
+          at: now,
+        };
+        past.push(record);
+        trim();
+        return record;
+      }
+
+      /** 撤销：返回要恢复的快照，并把“当前状态”存进重做栈。 */
+      function undo(current) {
+        const entry = past.pop();
+        if (!entry) return null;
+        future.push({ ...entry, after: current });
+        return { label: entry.label, snapshot: entry.before };
+      }
+
+      /** 重做：返回要恢复的快照，并把“当前状态”放回撤销栈。 */
+      function redo(current) {
+        const entry = future.pop();
+        if (!entry) return null;
+        past.push({ ...entry, before: current });
+        trim();
+        return { label: entry.label, snapshot: entry.after };
+      }
+
+      function reset() {
+        past.length = 0;
+        future.length = 0;
+      }
+
+      return {
+        push,
+        undo,
+        redo,
+        reset,
+        canUndo: () => past.length > 0,
+        canRedo: () => future.length > 0,
+        undoCount: () => past.length,
+        redoCount: () => future.length,
+        peekUndo: () => (past.length ? past[past.length - 1].label : null),
+        peekRedo: () => (future.length ? future[future.length - 1].label : null),
+      };
+    }
+
+    Object.assign(__exports, { HISTORY_LIMIT, createHistory });
   });
 
   __define("palette-link", function (__exports, __require) {
@@ -2819,7 +3016,8 @@
     const { createProject, serializeProject, parseProject, projectSizeBytes } = __require("project");
     const { makePaletteStrip, upscaleImage, encodePNG, buildExportFilename, buildPaletteFilename, buildProjectFilename, sanitizeBaseName } = __require("exporter");
     const { normalizeHex, parseHexPalette, formatHexPalette, clamp } = __require("color");
-    const { aspectLabel, buildExportMeta, clampZoom, computeFrame, defaultClipboardName, fitZoom, formatBytes, formatPercent, formatZoomPercent, parseZoomInput, rangeProgress, resolveCropSizeEdit, restoreCropSizeSnapshot, sliderToZoom, stepCropSize, stepZoom, wheelZoomFactor, zoomAroundPoint, zoomPercent, zoomShortcut, zoomToSlider } = __require("uistate");
+    const { createHistory } = __require("history");
+    const { aspectLabel, buildExportMeta, clampResultZoom, clampZoom, computeFrame, defaultClipboardName, fitResultZoom, fitZoom, formatBytes, formatPercent, formatResultZoom, formatZoomPercent, normalizeSplitMode, parseResultZoomInput, parseZoomInput, rangeProgress, resolveCropSizeEdit, resolveSplitMode, restoreCropSizeSnapshot, resultZoomToSlider, sliderToResultZoom, sliderToZoom, stepCropSize, stepZoom, wheelZoomFactor, zoomAroundPoint, zoomPercent, zoomShortcut, zoomToSlider } = __require("uistate");
     const { buildPaletteLookup, formatPixelInfo, formatPixelSummary, isLargeResult, paletteIndexOfColor, paletteStats, pixelColorAt, previewPointToPixel } = __require("palette-link");
 
     const MAX_UNDO = 50;
@@ -2846,6 +3044,8 @@
       colorSpatial: true,
       recolorMap: {},
       resultZoom: 4,
+      // 预览排列：side=左右，stack=上下；窗口过窄时显示上自动退化，不改写用户选择。
+      splitMode: 'side',
       exportScale: 1,
       // 调色盘联动：悬浮色块时是否在结果预览中高亮同色像素；旧工程缺省为开。
       hoverHighlight: true,
@@ -2864,7 +3064,7 @@
     };
 
     const finalPalette = [];
-    const recolorHistory = [];
+    const editHistory = createHistory({ limit: MAX_UNDO });
     const el = {};
 
     let sourceSequence = 0;
@@ -2886,6 +3086,13 @@
     // 滚轮缩放按帧合并：同一帧内的多个 wheel 事件只重绘 / 重建一次。
     let pendingWheelZoom = null;
     let wheelZoomQueued = false;
+    // 结果预览的滚轮缩放同样按帧合并，同时记录锚点，缩放围绕鼠标位置。
+    let pendingResultWheel = null;
+    let resultWheelQueued = false;
+    // 一次连续编辑（拖拽、改色取色）的事务：按下时记基线，松开时只写一条历史。
+    let editGesture = null;
+    // 当前实际生效的分割方式，用于判断按钮高亮与退化提示。
+    let appliedSplitMode = 'side';
 
     // 调色盘联动的当前状态。pixelIndex 是“结果预览”里当前悬停的输出像素；
     // swatchIndex 是鼠标悬停的调色盘色块。两者不会同时存在（鼠标只能在一个区域）。
@@ -2994,6 +3201,147 @@
       resetPaletteLink();
     }
 
+    /* ---------- 编辑历史 ---------- */
+
+    /**
+     * 一次“编辑”的完整快照。视图专有状态（结果预览倍率、分割方式、导出倍数）
+     * 不写入历史，撤销编辑时不会顺便改变用户正在看的视图。
+     */
+    function captureEditSnapshot() {
+      const transform = state.transform;
+      return {
+        transform: {
+          scale: transform.scale,
+          offsetX: transform.offsetX,
+          offsetY: transform.offsetY,
+          outputWidth: transform.outputWidth,
+          outputHeight: transform.outputHeight,
+        },
+        lockAspect: state.lockAspect,
+        aspectRatio: state.aspectRatio,
+        resample: state.resample,
+        colorMode: state.colorMode,
+        threshold: state.threshold,
+        maxColors: state.maxColors,
+        dither: state.dither,
+        colorSpatial: state.colorSpatial,
+        recolorMap: { ...state.recolorMap },
+      };
+    }
+
+    /** 判断两个快照是否真的产生了编辑，避免无操作的重复历史。 */
+    function editSnapshotKey(snapshot) {
+      const transform = snapshot.transform;
+      const recolor = Object.keys(snapshot.recolorMap)
+        .sort()
+        .map((from) => `${from}=${snapshot.recolorMap[from]}`)
+        .join(',');
+      return [
+        Number(transform.scale).toFixed(6),
+        Number(transform.offsetX).toFixed(4),
+        Number(transform.offsetY).toFixed(4),
+        transform.outputWidth,
+        transform.outputHeight,
+        snapshot.lockAspect ? 1 : 0,
+        Number(snapshot.aspectRatio).toFixed(6),
+        snapshot.resample,
+        snapshot.colorMode,
+        snapshot.threshold,
+        snapshot.maxColors,
+        snapshot.dither ? 1 : 0,
+        snapshot.colorSpatial ? 1 : 0,
+        recolor,
+      ].join('|');
+    }
+
+    function pushEditHistory(label, before, after, options = {}) {
+      if (editSnapshotKey(before) === editSnapshotKey(after)) return false;
+      editHistory.push(
+        { label, before, after },
+        { coalesceKey: options.coalesceKey || null, windowMs: options.windowMs || 0 },
+      );
+      updateActionAvailability();
+      return true;
+    }
+
+    /**
+     * 离散编辑：改一次就写一条历史。连续滑块 / 滚轮传入 coalesceKey 与时间窗，
+     * 同一串动作只保留第一条 before 与最后一条 after。
+     */
+    function recordEdit(label, mutate, options = {}) {
+      if (editGesture) commitEditGesture();
+      const before = captureEditSnapshot();
+      const result = mutate();
+      pushEditHistory(label, before, captureEditSnapshot(), options);
+      return result;
+    }
+
+    /** 连续手势（拖拽、取色）开始时记基线，结束时整体提交。 */
+    function beginEditGesture(label) {
+      if (!state.source || editGesture) return;
+      editGesture = { label, before: captureEditSnapshot() };
+    }
+
+    function commitEditGesture() {
+      if (!editGesture) return;
+      const gesture = editGesture;
+      editGesture = null;
+      pushEditHistory(gesture.label, gesture.before, captureEditSnapshot());
+    }
+
+    function applyEditSnapshot(snapshot) {
+      const transform = snapshot.transform;
+      state.transform.scale = clampZoom(transform.scale);
+      state.transform.offsetX = Number(transform.offsetX) || 0;
+      state.transform.offsetY = Number(transform.offsetY) || 0;
+      state.transform.outputWidth = transform.outputWidth;
+      state.transform.outputHeight = transform.outputHeight;
+      state.lockAspect = Boolean(snapshot.lockAspect);
+      state.aspectRatio = Number(snapshot.aspectRatio) || 1;
+      state.resample = snapshot.resample;
+      state.colorMode = snapshot.colorMode;
+      state.threshold = snapshot.threshold;
+      state.maxColors = snapshot.maxColors;
+      state.dither = Boolean(snapshot.dither);
+      state.colorSpatial = Boolean(snapshot.colorSpatial);
+      state.recolorMap = { ...snapshot.recolorMap };
+
+      markDirty();
+      syncAllControls();
+      drawSourcePreview();
+      rebuildPipeline();
+      updateEmptyStates();
+      updateActionAvailability();
+    }
+
+    function undoEdit() {
+      if (editGesture) commitEditGesture();
+      if (pendingWheelZoom) flushWheelZoom();
+      if (pendingResultWheel) flushResultWheelZoom();
+      if (!editHistory.canUndo()) return;
+      const step = editHistory.undo(captureEditSnapshot());
+      if (!step) return;
+      applyEditSnapshot(step.snapshot);
+      showToast(`已撤销：${step.label}`, 'info', 1600);
+    }
+
+    function redoEdit() {
+      if (editGesture) commitEditGesture();
+      if (pendingWheelZoom) flushWheelZoom();
+      if (pendingResultWheel) flushResultWheelZoom();
+      if (!editHistory.canRedo()) return;
+      const step = editHistory.redo(captureEditSnapshot());
+      if (!step) return;
+      applyEditSnapshot(step.snapshot);
+      showToast(`已重做：${step.label}`, 'info', 1600);
+    }
+
+    function resetEditHistory() {
+      editGesture = null;
+      editHistory.reset();
+      updateActionAvailability();
+    }
+
     /* ---------- 初始化 ---------- */
 
     function init() {
@@ -3004,6 +3352,7 @@
       syncAllControls();
       updateActionAvailability();
       updateEmptyStates();
+      updateSplitLayout();
       drawSourcePreview();
       updateSourceInfo();
       updateOutputInfo();
@@ -3016,18 +3365,21 @@
 
     function cacheElements() {
       const ids = [
-        'btnImport', 'btnOpenProject', 'btnSaveProject', 'topDot', 'topStatus',
+        'btnImport', 'btnOpenProject', 'btnSaveProject', 'btnUndo', 'btnRedo',
+        'topDot', 'topStatus',
         'outW', 'outH', 'lockAspect', 'aspectLabel', 'zoomRange', 'zoomInput',
         'btnZoomOut', 'btnZoomIn', 'btnZoomFit', 'btnZoomActual',
         'btnResetCrop', 'resampleSelect', 'resampleDesc', 'thresholdGroup',
         'targetGroup', 'thresholdRange', 'thresholdValue', 'targetColors',
-        'spatialToggle', 'ditherToggle', 'colorCount', 'approxState', 'approxHint', 'btnUndoRecolor',
+        'spatialToggle', 'ditherToggle', 'colorCount', 'approxState', 'approxHint',
         'btnResetRecolor', 'exportScale', 'exportFilename', 'exportStats',
         'btnExportPng', 'btnExportPalette', 'sourceWrap', 'sourceCanvas',
         'sourceEmpty', 'btnEmptyImport', 'btnEmptyProject', 'srcInfoBadge',
         'srcDims', 'srcZoom', 'srcOffset', 'srcCrop', 'resultScroll',
-        'resultCanvas', 'resultEmpty', 'resultZoomGroup', 'resultTip', 'outDims',
+        'centerStage', 'resultCanvas', 'resultEmpty', 'resultZoomGroup', 'resultTip', 'outDims',
         'outCrop', 'pixelCount', 'resultColors', 'pixelInfo', 'paletteCount',
+        'btnResultZoomOut', 'btnResultZoomIn', 'resultZoomInput', 'resultZoomRange',
+        'btnResultZoomFit', 'splitGroup', 'splitHint',
         'btnImportHex', 'btnExportHex', 'paletteHint', 'paletteList',
         'paletteEmpty', 'hoverHighlight', 'pixelTooltip', 'fileImage',
         'fileProject', 'fileHex', 'colorPicker',
@@ -3048,10 +3400,45 @@
 
     function setupObservers() {
       if (typeof ResizeObserver === 'function') {
-        const observer = new ResizeObserver(() => scheduleSourceDraw());
-        observer.observe(el.sourceWrap);
+        const sourceObserver = new ResizeObserver(() => scheduleSourceDraw());
+        sourceObserver.observe(el.sourceWrap);
+        const stageObserver = new ResizeObserver(() => updateSplitLayout());
+        stageObserver.observe(el.centerStage);
       }
-      window.addEventListener('resize', scheduleSourceDraw);
+      window.addEventListener('resize', () => {
+        scheduleSourceDraw();
+        updateSplitLayout();
+      });
+    }
+
+    /**
+     * 应用预览排列：用户选左右但中心区太窄时自动改为上下，并在顶部说明；
+     * 只改 CSS class，不改写 state.splitMode，窗口变宽后左右会自动恢复。
+     */
+    function updateSplitLayout() {
+      if (!el.centerStage) return;
+      const width = el.centerStage.clientWidth;
+      const effective = resolveSplitMode(state.splitMode, width);
+      const changed = effective !== appliedSplitMode;
+      appliedSplitMode = effective;
+      el.centerStage.classList.toggle('is-split-side', effective === 'side');
+      const fallback = state.splitMode === 'side' && effective === 'stack';
+      el.splitHint.hidden = !fallback;
+      if (changed) {
+        drawSourcePreview();
+        drawResultScaled();
+        centerResultScroll();
+      }
+      syncSplitButtons();
+    }
+
+    function syncSplitButtons() {
+      if (!el.splitGroup) return;
+      for (const button of el.splitGroup.querySelectorAll('button[data-split]')) {
+        const active = button.dataset.split === state.splitMode;
+        button.classList.toggle('is-active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+      }
     }
 
     /** 源图预览重绘按帧合并：滚轮连续滚动时每帧只画一次。 */
@@ -3072,11 +3459,12 @@
       el.btnOpenProject.addEventListener('click', () => el.fileProject.click());
       el.btnEmptyProject.addEventListener('click', () => el.fileProject.click());
       el.btnSaveProject.addEventListener('click', saveProject);
+      el.btnUndo.addEventListener('click', undoEdit);
+      el.btnRedo.addEventListener('click', redoEdit);
       el.btnExportPng.addEventListener('click', exportPng);
       el.btnExportPalette.addEventListener('click', exportPalettePng);
       el.btnImportHex.addEventListener('click', () => el.fileHex.click());
       el.btnExportHex.addEventListener('click', exportHexPalette);
-      el.btnUndoRecolor.addEventListener('click', undoRecolor);
       el.btnResetRecolor.addEventListener('click', resetRecolor);
       el.btnResetCrop.addEventListener('click', resetCrop);
       el.btnZoomIn.addEventListener('click', (event) => nudgeZoom(1, event.shiftKey));
@@ -3103,17 +3491,23 @@
       setupOutputInput(el.outW, 'width');
       setupOutputInput(el.outH, 'height');
       el.lockAspect.addEventListener('change', () => {
-        state.lockAspect = el.lockAspect.checked;
-        if (state.lockAspect) {
-          state.aspectRatio = state.transform.outputWidth / state.transform.outputHeight;
-        }
-        updateAspectLabel();
-        markDirty();
+        recordEdit('锁定宽高比', () => {
+          state.lockAspect = el.lockAspect.checked;
+          if (state.lockAspect) {
+            state.aspectRatio = state.transform.outputWidth / state.transform.outputHeight;
+          }
+          updateAspectLabel();
+          markDirty();
+        });
       });
 
       el.zoomRange.addEventListener('input', () => {
         if (!state.source) return;
-        applySourceZoom(sliderToZoom(el.zoomRange.value));
+        recordEdit(
+          '源图缩放',
+          () => applySourceZoom(sliderToZoom(el.zoomRange.value)),
+          { coalesceKey: 'source-zoom', windowMs: 400 },
+        );
       });
 
       el.zoomInput.addEventListener('keydown', (event) => {
@@ -3131,54 +3525,80 @@
       el.zoomInput.addEventListener('focus', () => el.zoomInput.select());
 
       el.resampleSelect.addEventListener('change', () => {
-        state.resample = isValidResample(el.resampleSelect.value) ? el.resampleSelect.value : 'nearest';
-        updateResampleDescription();
-        markDirty();
-        drawSourcePreview();
-        scheduleRebuild(true);
+        recordEdit('重采样算法', () => {
+          state.resample = isValidResample(el.resampleSelect.value) ? el.resampleSelect.value : 'nearest';
+          updateResampleDescription();
+          markDirty();
+          drawSourcePreview();
+          scheduleRebuild(true);
+        });
       });
 
       for (const radio of document.querySelectorAll('input[name="colorMode"]')) {
         radio.addEventListener('change', () => {
           if (!radio.checked) return;
-          state.colorMode = radio.value === 'target' ? 'target' : 'threshold';
-          updateModeUI();
-          markDirty();
-          scheduleRebuild(false);
+          recordEdit('颜色模式', () => {
+            state.colorMode = radio.value === 'target' ? 'target' : 'threshold';
+            updateModeUI();
+            markDirty();
+            scheduleRebuild(false);
+          });
         });
       }
 
       el.thresholdRange.addEventListener('input', () => {
-        state.threshold = clamp(Number(el.thresholdRange.value) || 0, 0, 100);
-        updateThresholdUI();
-        markDirty();
-        scheduleRebuild(false);
+        recordEdit(
+          '相近程度',
+          () => {
+            state.threshold = clamp(Number(el.thresholdRange.value) || 0, 0, 100);
+            updateThresholdUI();
+            markDirty();
+            scheduleRebuild(false);
+          },
+          { coalesceKey: 'threshold', windowMs: 400 },
+        );
       });
 
       el.targetColors.addEventListener('input', () => {
         const value = Number(el.targetColors.value);
         if (!Number.isFinite(value) || value < 2 || value > 256) return;
-        state.maxColors = Math.round(value);
-        markDirty();
-        scheduleRebuild(false);
+        recordEdit(
+          '目标色数',
+          () => {
+            state.maxColors = Math.round(value);
+            markDirty();
+            scheduleRebuild(false);
+          },
+          { coalesceKey: 'target-colors', windowMs: 400 },
+        );
       });
       el.targetColors.addEventListener('change', () => {
-        state.maxColors = Math.max(2, Math.min(256, Math.round(Number(el.targetColors.value) || 16)));
-        el.targetColors.value = String(state.maxColors);
-        markDirty();
-        scheduleRebuild(false);
+        recordEdit(
+          '目标色数',
+          () => {
+            state.maxColors = Math.max(2, Math.min(256, Math.round(Number(el.targetColors.value) || 16)));
+            el.targetColors.value = String(state.maxColors);
+            markDirty();
+            scheduleRebuild(false);
+          },
+          { coalesceKey: 'target-colors', windowMs: 400 },
+        );
       });
 
       el.spatialToggle.addEventListener('change', () => {
-        state.colorSpatial = el.spatialToggle.checked;
-        markDirty();
-        scheduleRebuild(false);
+        recordEdit('区域联动', () => {
+          state.colorSpatial = el.spatialToggle.checked;
+          markDirty();
+          scheduleRebuild(false);
+        });
       });
 
       el.ditherToggle.addEventListener('change', () => {
-        state.dither = el.ditherToggle.checked;
-        markDirty();
-        scheduleRebuild(false);
+        recordEdit('抖动', () => {
+          state.dither = el.ditherToggle.checked;
+          markDirty();
+          scheduleRebuild(false);
+        });
       });
 
       el.exportScale.addEventListener('change', () => {
@@ -3190,13 +3610,37 @@
         const button = event.target.closest('button[data-zoom]');
         if (!button) return;
         const zoom = Number(button.dataset.zoom);
-        if (![1, 4, 8].includes(zoom)) return;
-        // 反向高亮的掩码与当前倍数绑定，换挡前先清除，避免旧掩码被按新尺寸拉伸。
-        clearSwatchHighlight(false);
-        state.resultZoom = zoom;
-        syncResultZoomButtons();
-        drawResultScaled();
-        centerResultScroll();
+        if (![1, 2, 4].includes(zoom)) return;
+        setResultZoom(zoom);
+      });
+
+      el.resultZoomRange.addEventListener('input', () => {
+        setResultZoom(sliderToResultZoom(el.resultZoomRange.value));
+      });
+      el.btnResultZoomIn.addEventListener('click', () => nudgeResultZoom(1));
+      el.btnResultZoomOut.addEventListener('click', () => nudgeResultZoom(-1));
+      el.btnResultZoomFit.addEventListener('click', fitResultToView);
+      el.resultZoomInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          commitResultZoomInput();
+          el.resultZoomInput.blur();
+        } else if (event.key === 'Escape') {
+          event.preventDefault();
+          el.resultZoomInput.value = formatResultZoom(state.resultZoom);
+          el.resultZoomInput.blur();
+        }
+      });
+      el.resultZoomInput.addEventListener('blur', commitResultZoomInput);
+      el.resultZoomInput.addEventListener('focus', () => el.resultZoomInput.select());
+      // 滚轮在整个结果预览区生效：画布小于视口时，空白处也能继续缩放。
+      el.resultScroll.addEventListener('wheel', onResultWheel, { passive: false });
+
+      el.splitGroup.addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-split]');
+        if (!button) return;
+        state.splitMode = normalizeSplitMode(button.dataset.split);
+        updateSplitLayout();
       });
 
       el.resultCanvas.addEventListener('pointermove', onResultPointerMove);
@@ -3218,7 +3662,7 @@
         const hex = normalizeHex(el.colorPicker.value);
         if (!hex) return;
         if (!pickerSession.changed) {
-          pushHistory(pickerSession.snapshot);
+          beginEditGesture('改色');
           pickerSession.changed = true;
         }
         if (hex === pickerSession.sourceHex) {
@@ -3233,6 +3677,7 @@
       el.colorPicker.addEventListener('change', () => {
         if (!pickerSession) return;
         pickerSession = null;
+        commitEditGesture();
         updateActionAvailability();
       });
 
@@ -3351,8 +3796,11 @@
         showToast('宽高需要是 8~512 的整数，已恢复为原来的数值。', 'error', 3200);
         return;
       }
-      if (result.changed) applyCropSizes(result.width, result.height);
-      else syncOutputInputs();
+      if (result.changed) {
+        recordEdit('裁切尺寸', () => applyCropSizes(result.width, result.height));
+      } else {
+        syncOutputInputs();
+      }
     }
 
     /** Esc：放弃本次编辑，恢复进入输入框时的状态。 */
@@ -3379,8 +3827,15 @@
         ratio: state.lockAspect ? state.aspectRatio : 0,
         lockAspect: state.lockAspect,
       });
-      if (result.changed) applyCropSizes(result.width, result.height);
-      else syncOutputInputs();
+      if (result.changed) {
+        recordEdit(
+          '裁切尺寸',
+          () => applyCropSizes(result.width, result.height),
+          { coalesceKey: 'crop-size', windowMs: 400 },
+        );
+      } else {
+        syncOutputInputs();
+      }
     }
 
     /* ---------- 导入 / 工程 ---------- */
@@ -3475,7 +3930,7 @@
       state.createdAt = state.createdAt || new Date().toISOString();
       state.updatedAt = null;
       state.dirty = true;
-      recolorHistory.length = 0;
+      resetEditHistory();
       pickerSession = null;
       invalidateAll();
       syncAllControls();
@@ -3584,13 +4039,14 @@
       state.colorSpatial = project.colorSpatial;
       state.recolorMap = normalizeRecolorMap(project.recolorMap);
       state.resultZoom = project.ui.resultZoom;
+      state.splitMode = project.ui.splitMode;
       state.exportScale = project.ui.exportScale;
       state.hoverHighlight = project.ui.hoverHighlight;
       state.createdAt = project.createdAt;
       state.updatedAt = project.updatedAt;
       state.dirty = false;
 
-      recolorHistory.length = 0;
+      resetEditHistory();
       pickerSession = null;
       invalidateAll();
       syncAllControls();
@@ -3600,6 +4056,7 @@
       updateSourceInfo();
       drawSourcePreview();
       rebuildPipeline();
+      updateSplitLayout();
       centerResultScroll();
 
       const dimensionMismatch = imageData.width !== project.sourceWidth || imageData.height !== project.sourceHeight;
@@ -3763,6 +4220,8 @@
       if (!state.source || event.button !== 0) return;
       const view = getSourceView();
       if (!view) return;
+      if (editGesture) commitEditGesture();
+      beginEditGesture('移动画面');
       dragState = {
         pointerId: event.pointerId,
         x: event.clientX,
@@ -3805,6 +4264,7 @@
       if (!dragState || event.pointerId !== dragState.pointerId) return;
       dragState = null;
       el.sourceCanvas.classList.remove('is-dragging');
+      commitEditGesture();
     }
 
     function onWheel(event) {
@@ -3843,25 +4303,31 @@
       if (!view) return;
       const target = clampZoom(state.transform.scale * pending.factor);
       if (Math.abs(target - state.transform.scale) < 1e-6) {
-        // 已到 10% / 1600% 边界：只同步显示，避免控件与实际值脱节。
+        // 已到 1% / 6400% 边界：只同步显示，避免控件与实际值脱节。
         syncZoomControls();
         return;
       }
 
-      const next = zoomAroundPoint({
-        sourceWidth: state.source.width,
-        sourceHeight: state.source.height,
-        outputWidth: state.transform.outputWidth,
-        outputHeight: state.transform.outputHeight,
-        scale: state.transform.scale,
-        offsetX: state.transform.offsetX,
-        offsetY: state.transform.offsetY,
-        newScale: target,
-        pointerX: pending.pointerX,
-        pointerY: pending.pointerY,
-        frame: view.frame,
-      });
-      applyZoomTransform(next);
+      recordEdit(
+        '源图缩放',
+        () => {
+          const next = zoomAroundPoint({
+            sourceWidth: state.source.width,
+            sourceHeight: state.source.height,
+            outputWidth: state.transform.outputWidth,
+            outputHeight: state.transform.outputHeight,
+            scale: state.transform.scale,
+            offsetX: state.transform.offsetX,
+            offsetY: state.transform.offsetY,
+            newScale: target,
+            pointerX: pending.pointerX,
+            pointerY: pending.pointerY,
+            frame: view.frame,
+          });
+          applyZoomTransform(next);
+        },
+        { coalesceKey: 'source-zoom', windowMs: 400 },
+      );
     }
 
     /* ---------- 缩放控制 ---------- */
@@ -3894,7 +4360,11 @@
     /** -/+ 微调：direction > 0 放大；Shift（fine）时步长从 1.02 变 1.005。 */
     function nudgeZoom(direction, fine = false) {
       if (!state.source) return;
-      applySourceZoom(stepZoom(state.transform.scale, direction, fine));
+      recordEdit(
+        '源图缩放',
+        () => applySourceZoom(stepZoom(state.transform.scale, direction, fine)),
+        { coalesceKey: 'source-zoom-step', windowMs: 400 },
+      );
     }
 
     /** 百分比输入框：回车或失焦时解析，非法输入回退到当前值。 */
@@ -3903,25 +4373,29 @@
       const next = parseZoomInput(el.zoomInput.value, state.transform.scale);
       el.zoomInput.value = formatZoomPercent(next);
       if (!state.source) return;
-      if (Math.abs(next - state.transform.scale) > 1e-9) applySourceZoom(next);
+      if (Math.abs(next - state.transform.scale) > 1e-9) {
+        recordEdit('源图缩放', () => applySourceZoom(next));
+      }
     }
 
     /** 1:1：回到 100%，保留当前裁切中心。 */
     function resetZoomOneToOne() {
       if (!state.source) return;
-      applySourceZoom(1);
+      recordEdit('缩放到 1:1', () => applySourceZoom(1));
     }
 
     /** 适应窗口：让整张源图落入预览区并居中。 */
     function fitSourceToView() {
       if (!state.source) return;
-      const scale = fitZoom(
-        state.source.width,
-        state.source.height,
-        state.transform.outputWidth,
-        state.transform.outputHeight,
-      );
-      applySourceZoom(scale, 0, 0);
+      recordEdit('适应窗口', () => {
+        const scale = fitZoom(
+          state.source.width,
+          state.source.height,
+          state.transform.outputWidth,
+          state.transform.outputHeight,
+        );
+        applySourceZoom(scale, 0, 0);
+      });
     }
 
     /** 键盘 + / - / 0 / f 的实际动作。 */
@@ -3935,7 +4409,7 @@
     /** 重置裁切：100% 缩放并居中。 */
     function resetCrop() {
       if (!state.source) return;
-      applySourceZoom(1, 0, 0);
+      recordEdit('重置裁切', () => applySourceZoom(1, 0, 0));
     }
 
     /* ---------- 重建管线 ---------- */
@@ -4087,11 +4561,12 @@
     function drawResultScaled() {
       if (!outputCanvas || !state.source) {
         el.resultCanvas.hidden = true;
+        syncResultZoomControls();
         return;
       }
       const zoom = state.resultZoom;
-      const width = outputCanvas.width * zoom;
-      const height = outputCanvas.height * zoom;
+      const width = Math.max(1, Math.round(outputCanvas.width * zoom));
+      const height = Math.max(1, Math.round(outputCanvas.height * zoom));
       el.resultCanvas.hidden = false;
       if (el.resultCanvas.width !== width || el.resultCanvas.height !== height) {
         el.resultCanvas.width = width;
@@ -4102,7 +4577,88 @@
       context.clearRect(0, 0, width, height);
       context.drawImage(outputCanvas, 0, 0, width, height);
       paintSwatchHighlight(context);
-      el.resultTip.textContent = `${zoom}× 最近邻放大 · 实际 ${outputCanvas.width}×${outputCanvas.height}`;
+      el.resultTip.textContent = `${formatResultZoom(zoom)} 最近邻放大 · 实际 ${outputCanvas.width}×${outputCanvas.height}`;
+      syncResultZoomControls();
+    }
+
+    /** 连续结果缩放：以指针（或视口中心）为锚点，调整后保持该点不动。 */
+    function setResultZoom(value, anchor = null) {
+      if (!outputCanvas || !state.source) return;
+      const next = clampResultZoom(value);
+      if (Math.abs(next - state.resultZoom) < 1e-6) {
+        syncResultZoomControls();
+        return;
+      }
+
+      const scroll = el.resultScroll;
+      const oldRect = el.resultCanvas.getBoundingClientRect();
+      const scrollRect = scroll.getBoundingClientRect();
+      const anchorX = anchor?.clientX ?? scrollRect.left + scroll.clientWidth / 2;
+      const anchorY = anchor?.clientY ?? scrollRect.top + scroll.clientHeight / 2;
+      const relativeX = oldRect.width ? clamp((anchorX - oldRect.left) / oldRect.width, 0, 1) : 0.5;
+      const relativeY = oldRect.height ? clamp((anchorY - oldRect.top) / oldRect.height, 0, 1) : 0.5;
+
+      // 反向高亮的掩码与旧画布尺寸绑定，换挡前清除，避免被按新尺寸拉伸。
+      clearSwatchHighlight(false);
+      state.resultZoom = next;
+      drawResultScaled();
+
+      const newRect = el.resultCanvas.getBoundingClientRect();
+      scroll.scrollLeft += (newRect.left + relativeX * newRect.width) - anchorX;
+      scroll.scrollTop += (newRect.top + relativeY * newRect.height) - anchorY;
+    }
+
+    function nudgeResultZoom(direction) {
+      if (!outputCanvas || !state.source) return;
+      const factor = direction > 0 ? 1.25 : 0.8;
+      setResultZoom(state.resultZoom * factor);
+    }
+
+    function commitResultZoomInput() {
+      if (!el.resultZoomInput) return;
+      const next = parseResultZoomInput(el.resultZoomInput.value, state.resultZoom);
+      el.resultZoomInput.value = formatResultZoom(next);
+      setResultZoom(next);
+    }
+
+    function fitResultToView() {
+      if (!outputCanvas || !state.source) return;
+      const zoom = fitResultZoom(
+        outputCanvas.width,
+        outputCanvas.height,
+        el.resultScroll.clientWidth,
+        el.resultScroll.clientHeight,
+      );
+      setResultZoom(zoom);
+      centerResultScroll();
+    }
+
+    function onResultWheel(event) {
+      if (!outputCanvas || !state.source) return;
+      event.preventDefault();
+      const factor = wheelZoomFactor(event.deltaY, { shift: event.shiftKey });
+      if (factor === 1) return;
+      if (pendingResultWheel) {
+        pendingResultWheel.factor *= factor;
+        pendingResultWheel.clientX = event.clientX;
+        pendingResultWheel.clientY = event.clientY;
+      } else {
+        pendingResultWheel = { factor, clientX: event.clientX, clientY: event.clientY };
+      }
+      if (resultWheelQueued) return;
+      resultWheelQueued = true;
+      requestAnimationFrame(flushResultWheelZoom);
+    }
+
+    function flushResultWheelZoom() {
+      resultWheelQueued = false;
+      const pending = pendingResultWheel;
+      pendingResultWheel = null;
+      if (!pending) return;
+      setResultZoom(state.resultZoom * pending.factor, {
+        clientX: pending.clientX,
+        clientY: pending.clientY,
+      });
     }
 
     function centerResultScroll() {
@@ -4461,28 +5017,14 @@
       updateTimingText();
     }
 
-    function pushHistory(snapshot) {
-      recolorHistory.push({ ...snapshot });
-      if (recolorHistory.length > MAX_UNDO) recolorHistory.shift();
-      updateActionAvailability();
-    }
-
-    function undoRecolor() {
-      if (!recolorHistory.length) return;
-      state.recolorMap = recolorHistory.pop();
-      markDirty();
-      refreshRecolorOnly();
-      updateActionAvailability();
-      showToast('已撤销上一次改色');
-    }
-
     function resetRecolor() {
       if (!Object.keys(state.recolorMap).length) return;
-      pushHistory(state.recolorMap);
-      state.recolorMap = {};
-      markDirty();
-      refreshRecolorOnly();
-      updateActionAvailability();
+      recordEdit('还原配色', () => {
+        state.recolorMap = {};
+        markDirty();
+        refreshRecolorOnly();
+        updateActionAvailability();
+      });
       showToast('已还原为自动配色');
     }
 
@@ -4491,7 +5033,6 @@
       if (!entry) return;
       pickerSession = {
         sourceHex: entry.sourceHex,
-        snapshot: { ...state.recolorMap },
         changed: false,
       };
       el.colorPicker.value = entry.hex;
@@ -4509,17 +5050,18 @@
           showToast('文件中没有有效的 HEX 颜色，请检查文件内容。', 'error');
           return;
         }
-        pushHistory(state.recolorMap);
-        state.recolorMap = {};
-        const auto = cache.quantized.palette;
-        const count = Math.min(colors.length, auto.length);
-        for (let i = 0; i < count; i += 1) {
-          const sourceHex = auto[i].hex;
-          if (colors[i] !== sourceHex) state.recolorMap[sourceHex] = colors[i];
-        }
-        markDirty();
-        refreshRecolorOnly();
-        showToast(`已导入 ${colors.length} 个颜色，按顺序替换前 ${count} 个自动配色。`, 'success');
+        recordEdit('导入 HEX 配色', () => {
+          state.recolorMap = {};
+          const auto = cache.quantized.palette;
+          const count = Math.min(colors.length, auto.length);
+          for (let i = 0; i < count; i += 1) {
+            const sourceHex = auto[i].hex;
+            if (colors[i] !== sourceHex) state.recolorMap[sourceHex] = colors[i];
+          }
+          markDirty();
+          refreshRecolorOnly();
+          showToast(`已导入 ${colors.length} 个颜色，按顺序替换前 ${count} 个自动配色。`, 'success');
+        });
       }).catch((error) => {
         console.error(error);
         showToast(`读取调色盘失败：${error.message}。请检查文件内容。`, 'error');
@@ -4624,7 +5166,12 @@
       el.btnExportPalette.disabled = !hasSource || !hasResult;
       el.btnImportHex.disabled = !hasSource || !hasResult;
       el.btnExportHex.disabled = !hasSource || !hasResult;
-      el.btnUndoRecolor.disabled = recolorHistory.length === 0;
+      const undoLabel = editHistory.peekUndo();
+      const redoLabel = editHistory.peekRedo();
+      el.btnUndo.disabled = !undoLabel;
+      el.btnRedo.disabled = !redoLabel;
+      el.btnUndo.title = undoLabel ? `撤销：${undoLabel}（Ctrl+Z）` : '撤销（Ctrl+Z）';
+      el.btnRedo.title = redoLabel ? `重做：${redoLabel}（Ctrl+Shift+Z）` : '重做（Ctrl+Shift+Z）';
       el.btnResetRecolor.disabled = Object.keys(state.recolorMap).length === 0;
     }
 
@@ -4715,7 +5262,7 @@
       el.ditherToggle.checked = state.dither;
       el.exportScale.value = String(state.exportScale);
       el.hoverHighlight.checked = state.hoverHighlight;
-      syncResultZoomButtons();
+      syncResultZoomControls();
       updateExportMeta();
       updateActionAvailability();
     }
@@ -4761,9 +5308,20 @@
       timelineValue(el.thresholdRange, state.threshold);
     }
 
+    function syncResultZoomControls() {
+      if (el.resultZoomInput && document.activeElement !== el.resultZoomInput) {
+        el.resultZoomInput.value = formatResultZoom(state.resultZoom);
+      }
+      if (el.resultZoomRange) el.resultZoomRange.value = String(resultZoomToSlider(state.resultZoom));
+      syncResultZoomButtons();
+    }
+
     function syncResultZoomButtons() {
       for (const button of el.resultZoomGroup.querySelectorAll('button[data-zoom]')) {
-        button.classList.toggle('is-active', Number(button.dataset.zoom) === state.resultZoom);
+        const zoom = Number(button.dataset.zoom);
+        const active = Math.abs(zoom - state.resultZoom) < 1e-3;
+        button.classList.toggle('is-active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
       }
     }
 
@@ -4896,6 +5454,7 @@
           exportScale: state.exportScale,
           // 源图缩放百分比：恢复时优先使用，旧工程缺省时由 transform.scale 推导。
           sourceZoom: Math.round(zoomPercent(state.transform.scale) * 100) / 100,
+          splitMode: state.splitMode,
           hoverHighlight: state.hoverHighlight,
         },
       }, {
@@ -5012,7 +5571,13 @@
       }
       if (key === 'z' && !editing) {
         event.preventDefault();
-        undoRecolor();
+        if (event.shiftKey) redoEdit();
+        else undoEdit();
+        return;
+      }
+      if (key === 'y' && !editing) {
+        event.preventDefault();
+        redoEdit();
       }
     }
 
@@ -5036,6 +5601,8 @@
         colorSpatial: state.colorSpatial,
         recolorMap: { ...state.recolorMap },
         resultZoom: state.resultZoom,
+        splitMode: state.splitMode,
+        effectiveSplitMode: appliedSplitMode,
         hoverHighlight: state.hoverHighlight,
         colors: finalPalette.length,
         approximate: Boolean(cache.quantized?.approximate),
@@ -5126,11 +5693,22 @@
           return getDebugState();
         },
         resetPalette() {
-          state.recolorMap = {};
-          recolorHistory.length = 0;
-          markDirty();
-          refreshRecolorOnly();
+          recordEdit('还原配色', () => {
+            state.recolorMap = {};
+            markDirty();
+            refreshRecolorOnly();
+          });
           return getDebugState();
+        },
+        undo: undoEdit,
+        redo: redoEdit,
+        getHistoryState() {
+          return {
+            undo: editHistory.undoCount(),
+            redo: editHistory.redoCount(),
+            undoLabel: editHistory.peekUndo(),
+            redoLabel: editHistory.peekRedo(),
+          };
         },
         getTimings: () => ({ ...lastTimings }),
         getHoverState() {

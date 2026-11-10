@@ -67,7 +67,23 @@ test('UI 状态：旧工程缺少 exportScale 时回退为 1，非法值被拒�
   assert.equal(parseProject(JSON.stringify(raw)).ui.exportScale, 16);
 
   raw.ui.resultZoom = 2;
-  assert.equal(parseProject(JSON.stringify(raw)).ui.resultZoom, 4);
+  assert.equal(parseProject(JSON.stringify(raw)).ui.resultZoom, 2);
+  raw.ui.resultZoom = 2.5;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.resultZoom, 2.5);
+  raw.ui.resultZoom = 0.1;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.resultZoom, 0.25);
+  raw.ui.resultZoom = 99;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.resultZoom, 8);
+});
+
+test('UI 分割方式：缺省与非法值回退左右，stack 原样保留', () => {
+  const raw = JSON.parse(serializeProject(example()));
+  delete raw.ui.splitMode;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.splitMode, 'side');
+  raw.ui.splitMode = 'diagonal';
+  assert.equal(parseProject(JSON.stringify(raw)).ui.splitMode, 'side');
+  raw.ui.splitMode = 'stack';
+  assert.equal(parseProject(JSON.stringify(raw)).ui.splitMode, 'stack');
 });
 
 test('UI 缩放：保存/恢复 sourceZoom，旧工程按 transform.scale 回退', () => {

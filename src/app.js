@@ -34,20 +34,29 @@ import {
   formatHexPalette,
   clamp,
 } from './color.js';
+import { createHistory } from './history.js';
 import {
   aspectLabel,
   buildExportMeta,
+  clampResultZoom,
   clampZoom,
   computeFrame,
   defaultClipboardName,
+  fitResultZoom,
   fitZoom,
   formatBytes,
   formatPercent,
+  formatResultZoom,
   formatZoomPercent,
+  normalizeSplitMode,
+  parseResultZoomInput,
   parseZoomInput,
   rangeProgress,
   resolveCropSizeEdit,
+  resolveSplitMode,
   restoreCropSizeSnapshot,
+  resultZoomToSlider,
+  sliderToResultZoom,
   sliderToZoom,
   stepCropSize,
   stepZoom,
@@ -92,6 +101,8 @@ const state = {
   colorSpatial: true,
   recolorMap: {},
   resultZoom: 4,
+  // 预览排列：side=左右，stack=上下；窗口过窄时显示上自动退化，不改写用户选择。
+  splitMode: 'side',
   exportScale: 1,
   // 调色盘联动：悬浮色块时是否在结果预览中高亮同色像素；旧工程缺省为开。
   hoverHighlight: true,
@@ -110,7 +121,7 @@ const cache = {
 };
 
 const finalPalette = [];
-const recolorHistory = [];
+const editHistory = createHistory({ limit: MAX_UNDO });
 const el = {};
 
 let sourceSequence = 0;
@@ -132,6 +143,13 @@ let lastClampNotice = 0;
 // 滚轮缩放按帧合并：同一帧内的多个 wheel 事件只重绘 / 重建一次。
 let pendingWheelZoom = null;
 let wheelZoomQueued = false;
+// 结果预览的滚轮缩放同样按帧合并，同时记录锚点，缩放围绕鼠标位置。
+let pendingResultWheel = null;
+let resultWheelQueued = false;
+// 一次连续编辑（拖拽、改色取色）的事务：按下时记基线，松开时只写一条历史。
+let editGesture = null;
+// 当前实际生效的分割方式，用于判断按钮高亮与退化提示。
+let appliedSplitMode = 'side';
 
 // 调色盘联动的当前状态。pixelIndex 是“结果预览”里当前悬停的输出像素；
 // swatchIndex 是鼠标悬停的调色盘色块。两者不会同时存在（鼠标只能在一个区域）。
@@ -240,6 +258,147 @@ function invalidateAll() {
   resetPaletteLink();
 }
 
+/* ---------- 编辑历史 ---------- */
+
+/**
+ * 一次“编辑”的完整快照。视图专有状态（结果预览倍率、分割方式、导出倍数）
+ * 不写入历史，撤销编辑时不会顺便改变用户正在看的视图。
+ */
+function captureEditSnapshot() {
+  const transform = state.transform;
+  return {
+    transform: {
+      scale: transform.scale,
+      offsetX: transform.offsetX,
+      offsetY: transform.offsetY,
+      outputWidth: transform.outputWidth,
+      outputHeight: transform.outputHeight,
+    },
+    lockAspect: state.lockAspect,
+    aspectRatio: state.aspectRatio,
+    resample: state.resample,
+    colorMode: state.colorMode,
+    threshold: state.threshold,
+    maxColors: state.maxColors,
+    dither: state.dither,
+    colorSpatial: state.colorSpatial,
+    recolorMap: { ...state.recolorMap },
+  };
+}
+
+/** 判断两个快照是否真的产生了编辑，避免无操作的重复历史。 */
+function editSnapshotKey(snapshot) {
+  const transform = snapshot.transform;
+  const recolor = Object.keys(snapshot.recolorMap)
+    .sort()
+    .map((from) => `${from}=${snapshot.recolorMap[from]}`)
+    .join(',');
+  return [
+    Number(transform.scale).toFixed(6),
+    Number(transform.offsetX).toFixed(4),
+    Number(transform.offsetY).toFixed(4),
+    transform.outputWidth,
+    transform.outputHeight,
+    snapshot.lockAspect ? 1 : 0,
+    Number(snapshot.aspectRatio).toFixed(6),
+    snapshot.resample,
+    snapshot.colorMode,
+    snapshot.threshold,
+    snapshot.maxColors,
+    snapshot.dither ? 1 : 0,
+    snapshot.colorSpatial ? 1 : 0,
+    recolor,
+  ].join('|');
+}
+
+function pushEditHistory(label, before, after, options = {}) {
+  if (editSnapshotKey(before) === editSnapshotKey(after)) return false;
+  editHistory.push(
+    { label, before, after },
+    { coalesceKey: options.coalesceKey || null, windowMs: options.windowMs || 0 },
+  );
+  updateActionAvailability();
+  return true;
+}
+
+/**
+ * 离散编辑：改一次就写一条历史。连续滑块 / 滚轮传入 coalesceKey 与时间窗，
+ * 同一串动作只保留第一条 before 与最后一条 after。
+ */
+function recordEdit(label, mutate, options = {}) {
+  if (editGesture) commitEditGesture();
+  const before = captureEditSnapshot();
+  const result = mutate();
+  pushEditHistory(label, before, captureEditSnapshot(), options);
+  return result;
+}
+
+/** 连续手势（拖拽、取色）开始时记基线，结束时整体提交。 */
+function beginEditGesture(label) {
+  if (!state.source || editGesture) return;
+  editGesture = { label, before: captureEditSnapshot() };
+}
+
+function commitEditGesture() {
+  if (!editGesture) return;
+  const gesture = editGesture;
+  editGesture = null;
+  pushEditHistory(gesture.label, gesture.before, captureEditSnapshot());
+}
+
+function applyEditSnapshot(snapshot) {
+  const transform = snapshot.transform;
+  state.transform.scale = clampZoom(transform.scale);
+  state.transform.offsetX = Number(transform.offsetX) || 0;
+  state.transform.offsetY = Number(transform.offsetY) || 0;
+  state.transform.outputWidth = transform.outputWidth;
+  state.transform.outputHeight = transform.outputHeight;
+  state.lockAspect = Boolean(snapshot.lockAspect);
+  state.aspectRatio = Number(snapshot.aspectRatio) || 1;
+  state.resample = snapshot.resample;
+  state.colorMode = snapshot.colorMode;
+  state.threshold = snapshot.threshold;
+  state.maxColors = snapshot.maxColors;
+  state.dither = Boolean(snapshot.dither);
+  state.colorSpatial = Boolean(snapshot.colorSpatial);
+  state.recolorMap = { ...snapshot.recolorMap };
+
+  markDirty();
+  syncAllControls();
+  drawSourcePreview();
+  rebuildPipeline();
+  updateEmptyStates();
+  updateActionAvailability();
+}
+
+function undoEdit() {
+  if (editGesture) commitEditGesture();
+  if (pendingWheelZoom) flushWheelZoom();
+  if (pendingResultWheel) flushResultWheelZoom();
+  if (!editHistory.canUndo()) return;
+  const step = editHistory.undo(captureEditSnapshot());
+  if (!step) return;
+  applyEditSnapshot(step.snapshot);
+  showToast(`已撤销：${step.label}`, 'info', 1600);
+}
+
+function redoEdit() {
+  if (editGesture) commitEditGesture();
+  if (pendingWheelZoom) flushWheelZoom();
+  if (pendingResultWheel) flushResultWheelZoom();
+  if (!editHistory.canRedo()) return;
+  const step = editHistory.redo(captureEditSnapshot());
+  if (!step) return;
+  applyEditSnapshot(step.snapshot);
+  showToast(`已重做：${step.label}`, 'info', 1600);
+}
+
+function resetEditHistory() {
+  editGesture = null;
+  editHistory.reset();
+  updateActionAvailability();
+}
+
 /* ---------- 初始化 ---------- */
 
 function init() {
@@ -250,6 +409,7 @@ function init() {
   syncAllControls();
   updateActionAvailability();
   updateEmptyStates();
+  updateSplitLayout();
   drawSourcePreview();
   updateSourceInfo();
   updateOutputInfo();
@@ -262,18 +422,21 @@ function init() {
 
 function cacheElements() {
   const ids = [
-    'btnImport', 'btnOpenProject', 'btnSaveProject', 'topDot', 'topStatus',
+    'btnImport', 'btnOpenProject', 'btnSaveProject', 'btnUndo', 'btnRedo',
+    'topDot', 'topStatus',
     'outW', 'outH', 'lockAspect', 'aspectLabel', 'zoomRange', 'zoomInput',
     'btnZoomOut', 'btnZoomIn', 'btnZoomFit', 'btnZoomActual',
     'btnResetCrop', 'resampleSelect', 'resampleDesc', 'thresholdGroup',
     'targetGroup', 'thresholdRange', 'thresholdValue', 'targetColors',
-    'spatialToggle', 'ditherToggle', 'colorCount', 'approxState', 'approxHint', 'btnUndoRecolor',
+    'spatialToggle', 'ditherToggle', 'colorCount', 'approxState', 'approxHint',
     'btnResetRecolor', 'exportScale', 'exportFilename', 'exportStats',
     'btnExportPng', 'btnExportPalette', 'sourceWrap', 'sourceCanvas',
     'sourceEmpty', 'btnEmptyImport', 'btnEmptyProject', 'srcInfoBadge',
     'srcDims', 'srcZoom', 'srcOffset', 'srcCrop', 'resultScroll',
-    'resultCanvas', 'resultEmpty', 'resultZoomGroup', 'resultTip', 'outDims',
+    'centerStage', 'resultCanvas', 'resultEmpty', 'resultZoomGroup', 'resultTip', 'outDims',
     'outCrop', 'pixelCount', 'resultColors', 'pixelInfo', 'paletteCount',
+    'btnResultZoomOut', 'btnResultZoomIn', 'resultZoomInput', 'resultZoomRange',
+    'btnResultZoomFit', 'splitGroup', 'splitHint',
     'btnImportHex', 'btnExportHex', 'paletteHint', 'paletteList',
     'paletteEmpty', 'hoverHighlight', 'pixelTooltip', 'fileImage',
     'fileProject', 'fileHex', 'colorPicker',
@@ -294,10 +457,45 @@ function populateResampleSelect() {
 
 function setupObservers() {
   if (typeof ResizeObserver === 'function') {
-    const observer = new ResizeObserver(() => scheduleSourceDraw());
-    observer.observe(el.sourceWrap);
+    const sourceObserver = new ResizeObserver(() => scheduleSourceDraw());
+    sourceObserver.observe(el.sourceWrap);
+    const stageObserver = new ResizeObserver(() => updateSplitLayout());
+    stageObserver.observe(el.centerStage);
   }
-  window.addEventListener('resize', scheduleSourceDraw);
+  window.addEventListener('resize', () => {
+    scheduleSourceDraw();
+    updateSplitLayout();
+  });
+}
+
+/**
+ * 应用预览排列：用户选左右但中心区太窄时自动改为上下，并在顶部说明；
+ * 只改 CSS class，不改写 state.splitMode，窗口变宽后左右会自动恢复。
+ */
+function updateSplitLayout() {
+  if (!el.centerStage) return;
+  const width = el.centerStage.clientWidth;
+  const effective = resolveSplitMode(state.splitMode, width);
+  const changed = effective !== appliedSplitMode;
+  appliedSplitMode = effective;
+  el.centerStage.classList.toggle('is-split-side', effective === 'side');
+  const fallback = state.splitMode === 'side' && effective === 'stack';
+  el.splitHint.hidden = !fallback;
+  if (changed) {
+    drawSourcePreview();
+    drawResultScaled();
+    centerResultScroll();
+  }
+  syncSplitButtons();
+}
+
+function syncSplitButtons() {
+  if (!el.splitGroup) return;
+  for (const button of el.splitGroup.querySelectorAll('button[data-split]')) {
+    const active = button.dataset.split === state.splitMode;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
 }
 
 /** 源图预览重绘按帧合并：滚轮连续滚动时每帧只画一次。 */
@@ -318,11 +516,12 @@ function bindEvents() {
   el.btnOpenProject.addEventListener('click', () => el.fileProject.click());
   el.btnEmptyProject.addEventListener('click', () => el.fileProject.click());
   el.btnSaveProject.addEventListener('click', saveProject);
+  el.btnUndo.addEventListener('click', undoEdit);
+  el.btnRedo.addEventListener('click', redoEdit);
   el.btnExportPng.addEventListener('click', exportPng);
   el.btnExportPalette.addEventListener('click', exportPalettePng);
   el.btnImportHex.addEventListener('click', () => el.fileHex.click());
   el.btnExportHex.addEventListener('click', exportHexPalette);
-  el.btnUndoRecolor.addEventListener('click', undoRecolor);
   el.btnResetRecolor.addEventListener('click', resetRecolor);
   el.btnResetCrop.addEventListener('click', resetCrop);
   el.btnZoomIn.addEventListener('click', (event) => nudgeZoom(1, event.shiftKey));
@@ -349,17 +548,23 @@ function bindEvents() {
   setupOutputInput(el.outW, 'width');
   setupOutputInput(el.outH, 'height');
   el.lockAspect.addEventListener('change', () => {
-    state.lockAspect = el.lockAspect.checked;
-    if (state.lockAspect) {
-      state.aspectRatio = state.transform.outputWidth / state.transform.outputHeight;
-    }
-    updateAspectLabel();
-    markDirty();
+    recordEdit('锁定宽高比', () => {
+      state.lockAspect = el.lockAspect.checked;
+      if (state.lockAspect) {
+        state.aspectRatio = state.transform.outputWidth / state.transform.outputHeight;
+      }
+      updateAspectLabel();
+      markDirty();
+    });
   });
 
   el.zoomRange.addEventListener('input', () => {
     if (!state.source) return;
-    applySourceZoom(sliderToZoom(el.zoomRange.value));
+    recordEdit(
+      '源图缩放',
+      () => applySourceZoom(sliderToZoom(el.zoomRange.value)),
+      { coalesceKey: 'source-zoom', windowMs: 400 },
+    );
   });
 
   el.zoomInput.addEventListener('keydown', (event) => {
@@ -377,54 +582,80 @@ function bindEvents() {
   el.zoomInput.addEventListener('focus', () => el.zoomInput.select());
 
   el.resampleSelect.addEventListener('change', () => {
-    state.resample = isValidResample(el.resampleSelect.value) ? el.resampleSelect.value : 'nearest';
-    updateResampleDescription();
-    markDirty();
-    drawSourcePreview();
-    scheduleRebuild(true);
+    recordEdit('重采样算法', () => {
+      state.resample = isValidResample(el.resampleSelect.value) ? el.resampleSelect.value : 'nearest';
+      updateResampleDescription();
+      markDirty();
+      drawSourcePreview();
+      scheduleRebuild(true);
+    });
   });
 
   for (const radio of document.querySelectorAll('input[name="colorMode"]')) {
     radio.addEventListener('change', () => {
       if (!radio.checked) return;
-      state.colorMode = radio.value === 'target' ? 'target' : 'threshold';
-      updateModeUI();
-      markDirty();
-      scheduleRebuild(false);
+      recordEdit('颜色模式', () => {
+        state.colorMode = radio.value === 'target' ? 'target' : 'threshold';
+        updateModeUI();
+        markDirty();
+        scheduleRebuild(false);
+      });
     });
   }
 
   el.thresholdRange.addEventListener('input', () => {
-    state.threshold = clamp(Number(el.thresholdRange.value) || 0, 0, 100);
-    updateThresholdUI();
-    markDirty();
-    scheduleRebuild(false);
+    recordEdit(
+      '相近程度',
+      () => {
+        state.threshold = clamp(Number(el.thresholdRange.value) || 0, 0, 100);
+        updateThresholdUI();
+        markDirty();
+        scheduleRebuild(false);
+      },
+      { coalesceKey: 'threshold', windowMs: 400 },
+    );
   });
 
   el.targetColors.addEventListener('input', () => {
     const value = Number(el.targetColors.value);
     if (!Number.isFinite(value) || value < 2 || value > 256) return;
-    state.maxColors = Math.round(value);
-    markDirty();
-    scheduleRebuild(false);
+    recordEdit(
+      '目标色数',
+      () => {
+        state.maxColors = Math.round(value);
+        markDirty();
+        scheduleRebuild(false);
+      },
+      { coalesceKey: 'target-colors', windowMs: 400 },
+    );
   });
   el.targetColors.addEventListener('change', () => {
-    state.maxColors = Math.max(2, Math.min(256, Math.round(Number(el.targetColors.value) || 16)));
-    el.targetColors.value = String(state.maxColors);
-    markDirty();
-    scheduleRebuild(false);
+    recordEdit(
+      '目标色数',
+      () => {
+        state.maxColors = Math.max(2, Math.min(256, Math.round(Number(el.targetColors.value) || 16)));
+        el.targetColors.value = String(state.maxColors);
+        markDirty();
+        scheduleRebuild(false);
+      },
+      { coalesceKey: 'target-colors', windowMs: 400 },
+    );
   });
 
   el.spatialToggle.addEventListener('change', () => {
-    state.colorSpatial = el.spatialToggle.checked;
-    markDirty();
-    scheduleRebuild(false);
+    recordEdit('区域联动', () => {
+      state.colorSpatial = el.spatialToggle.checked;
+      markDirty();
+      scheduleRebuild(false);
+    });
   });
 
   el.ditherToggle.addEventListener('change', () => {
-    state.dither = el.ditherToggle.checked;
-    markDirty();
-    scheduleRebuild(false);
+    recordEdit('抖动', () => {
+      state.dither = el.ditherToggle.checked;
+      markDirty();
+      scheduleRebuild(false);
+    });
   });
 
   el.exportScale.addEventListener('change', () => {
@@ -436,13 +667,37 @@ function bindEvents() {
     const button = event.target.closest('button[data-zoom]');
     if (!button) return;
     const zoom = Number(button.dataset.zoom);
-    if (![1, 4, 8].includes(zoom)) return;
-    // 反向高亮的掩码与当前倍数绑定，换挡前先清除，避免旧掩码被按新尺寸拉伸。
-    clearSwatchHighlight(false);
-    state.resultZoom = zoom;
-    syncResultZoomButtons();
-    drawResultScaled();
-    centerResultScroll();
+    if (![1, 2, 4].includes(zoom)) return;
+    setResultZoom(zoom);
+  });
+
+  el.resultZoomRange.addEventListener('input', () => {
+    setResultZoom(sliderToResultZoom(el.resultZoomRange.value));
+  });
+  el.btnResultZoomIn.addEventListener('click', () => nudgeResultZoom(1));
+  el.btnResultZoomOut.addEventListener('click', () => nudgeResultZoom(-1));
+  el.btnResultZoomFit.addEventListener('click', fitResultToView);
+  el.resultZoomInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      commitResultZoomInput();
+      el.resultZoomInput.blur();
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      el.resultZoomInput.value = formatResultZoom(state.resultZoom);
+      el.resultZoomInput.blur();
+    }
+  });
+  el.resultZoomInput.addEventListener('blur', commitResultZoomInput);
+  el.resultZoomInput.addEventListener('focus', () => el.resultZoomInput.select());
+  // 滚轮在整个结果预览区生效：画布小于视口时，空白处也能继续缩放。
+  el.resultScroll.addEventListener('wheel', onResultWheel, { passive: false });
+
+  el.splitGroup.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-split]');
+    if (!button) return;
+    state.splitMode = normalizeSplitMode(button.dataset.split);
+    updateSplitLayout();
   });
 
   el.resultCanvas.addEventListener('pointermove', onResultPointerMove);
@@ -464,7 +719,7 @@ function bindEvents() {
     const hex = normalizeHex(el.colorPicker.value);
     if (!hex) return;
     if (!pickerSession.changed) {
-      pushHistory(pickerSession.snapshot);
+      beginEditGesture('改色');
       pickerSession.changed = true;
     }
     if (hex === pickerSession.sourceHex) {
@@ -479,6 +734,7 @@ function bindEvents() {
   el.colorPicker.addEventListener('change', () => {
     if (!pickerSession) return;
     pickerSession = null;
+    commitEditGesture();
     updateActionAvailability();
   });
 
@@ -597,8 +853,11 @@ function commitSizeEdit(which) {
     showToast('宽高需要是 8~512 的整数，已恢复为原来的数值。', 'error', 3200);
     return;
   }
-  if (result.changed) applyCropSizes(result.width, result.height);
-  else syncOutputInputs();
+  if (result.changed) {
+    recordEdit('裁切尺寸', () => applyCropSizes(result.width, result.height));
+  } else {
+    syncOutputInputs();
+  }
 }
 
 /** Esc：放弃本次编辑，恢复进入输入框时的状态。 */
@@ -625,8 +884,15 @@ function stepSizeEdit(which, delta) {
     ratio: state.lockAspect ? state.aspectRatio : 0,
     lockAspect: state.lockAspect,
   });
-  if (result.changed) applyCropSizes(result.width, result.height);
-  else syncOutputInputs();
+  if (result.changed) {
+    recordEdit(
+      '裁切尺寸',
+      () => applyCropSizes(result.width, result.height),
+      { coalesceKey: 'crop-size', windowMs: 400 },
+    );
+  } else {
+    syncOutputInputs();
+  }
 }
 
 /* ---------- 导入 / 工程 ---------- */
@@ -721,7 +987,7 @@ async function installSource(dataUrl, name, options = {}) {
   state.createdAt = state.createdAt || new Date().toISOString();
   state.updatedAt = null;
   state.dirty = true;
-  recolorHistory.length = 0;
+  resetEditHistory();
   pickerSession = null;
   invalidateAll();
   syncAllControls();
@@ -830,13 +1096,14 @@ async function loadProjectText(text, options = {}) {
   state.colorSpatial = project.colorSpatial;
   state.recolorMap = normalizeRecolorMap(project.recolorMap);
   state.resultZoom = project.ui.resultZoom;
+  state.splitMode = project.ui.splitMode;
   state.exportScale = project.ui.exportScale;
   state.hoverHighlight = project.ui.hoverHighlight;
   state.createdAt = project.createdAt;
   state.updatedAt = project.updatedAt;
   state.dirty = false;
 
-  recolorHistory.length = 0;
+  resetEditHistory();
   pickerSession = null;
   invalidateAll();
   syncAllControls();
@@ -846,6 +1113,7 @@ async function loadProjectText(text, options = {}) {
   updateSourceInfo();
   drawSourcePreview();
   rebuildPipeline();
+  updateSplitLayout();
   centerResultScroll();
 
   const dimensionMismatch = imageData.width !== project.sourceWidth || imageData.height !== project.sourceHeight;
@@ -1009,6 +1277,8 @@ function onPointerDown(event) {
   if (!state.source || event.button !== 0) return;
   const view = getSourceView();
   if (!view) return;
+  if (editGesture) commitEditGesture();
+  beginEditGesture('移动画面');
   dragState = {
     pointerId: event.pointerId,
     x: event.clientX,
@@ -1051,6 +1321,7 @@ function onPointerUp(event) {
   if (!dragState || event.pointerId !== dragState.pointerId) return;
   dragState = null;
   el.sourceCanvas.classList.remove('is-dragging');
+  commitEditGesture();
 }
 
 function onWheel(event) {
@@ -1089,25 +1360,31 @@ function flushWheelZoom() {
   if (!view) return;
   const target = clampZoom(state.transform.scale * pending.factor);
   if (Math.abs(target - state.transform.scale) < 1e-6) {
-    // 已到 10% / 1600% 边界：只同步显示，避免控件与实际值脱节。
+    // 已到 1% / 6400% 边界：只同步显示，避免控件与实际值脱节。
     syncZoomControls();
     return;
   }
 
-  const next = zoomAroundPoint({
-    sourceWidth: state.source.width,
-    sourceHeight: state.source.height,
-    outputWidth: state.transform.outputWidth,
-    outputHeight: state.transform.outputHeight,
-    scale: state.transform.scale,
-    offsetX: state.transform.offsetX,
-    offsetY: state.transform.offsetY,
-    newScale: target,
-    pointerX: pending.pointerX,
-    pointerY: pending.pointerY,
-    frame: view.frame,
-  });
-  applyZoomTransform(next);
+  recordEdit(
+    '源图缩放',
+    () => {
+      const next = zoomAroundPoint({
+        sourceWidth: state.source.width,
+        sourceHeight: state.source.height,
+        outputWidth: state.transform.outputWidth,
+        outputHeight: state.transform.outputHeight,
+        scale: state.transform.scale,
+        offsetX: state.transform.offsetX,
+        offsetY: state.transform.offsetY,
+        newScale: target,
+        pointerX: pending.pointerX,
+        pointerY: pending.pointerY,
+        frame: view.frame,
+      });
+      applyZoomTransform(next);
+    },
+    { coalesceKey: 'source-zoom', windowMs: 400 },
+  );
 }
 
 /* ---------- 缩放控制 ---------- */
@@ -1140,7 +1417,11 @@ function applySourceZoom(scale, offsetX = state.transform.offsetX, offsetY = sta
 /** -/+ 微调：direction > 0 放大；Shift（fine）时步长从 1.02 变 1.005。 */
 function nudgeZoom(direction, fine = false) {
   if (!state.source) return;
-  applySourceZoom(stepZoom(state.transform.scale, direction, fine));
+  recordEdit(
+    '源图缩放',
+    () => applySourceZoom(stepZoom(state.transform.scale, direction, fine)),
+    { coalesceKey: 'source-zoom-step', windowMs: 400 },
+  );
 }
 
 /** 百分比输入框：回车或失焦时解析，非法输入回退到当前值。 */
@@ -1149,25 +1430,29 @@ function commitZoomInput() {
   const next = parseZoomInput(el.zoomInput.value, state.transform.scale);
   el.zoomInput.value = formatZoomPercent(next);
   if (!state.source) return;
-  if (Math.abs(next - state.transform.scale) > 1e-9) applySourceZoom(next);
+  if (Math.abs(next - state.transform.scale) > 1e-9) {
+    recordEdit('源图缩放', () => applySourceZoom(next));
+  }
 }
 
 /** 1:1：回到 100%，保留当前裁切中心。 */
 function resetZoomOneToOne() {
   if (!state.source) return;
-  applySourceZoom(1);
+  recordEdit('缩放到 1:1', () => applySourceZoom(1));
 }
 
 /** 适应窗口：让整张源图落入预览区并居中。 */
 function fitSourceToView() {
   if (!state.source) return;
-  const scale = fitZoom(
-    state.source.width,
-    state.source.height,
-    state.transform.outputWidth,
-    state.transform.outputHeight,
-  );
-  applySourceZoom(scale, 0, 0);
+  recordEdit('适应窗口', () => {
+    const scale = fitZoom(
+      state.source.width,
+      state.source.height,
+      state.transform.outputWidth,
+      state.transform.outputHeight,
+    );
+    applySourceZoom(scale, 0, 0);
+  });
 }
 
 /** 键盘 + / - / 0 / f 的实际动作。 */
@@ -1181,7 +1466,7 @@ function runZoomShortcut(action) {
 /** 重置裁切：100% 缩放并居中。 */
 function resetCrop() {
   if (!state.source) return;
-  applySourceZoom(1, 0, 0);
+  recordEdit('重置裁切', () => applySourceZoom(1, 0, 0));
 }
 
 /* ---------- 重建管线 ---------- */
@@ -1333,11 +1618,12 @@ function ensureOutputCanvas(width, height) {
 function drawResultScaled() {
   if (!outputCanvas || !state.source) {
     el.resultCanvas.hidden = true;
+    syncResultZoomControls();
     return;
   }
   const zoom = state.resultZoom;
-  const width = outputCanvas.width * zoom;
-  const height = outputCanvas.height * zoom;
+  const width = Math.max(1, Math.round(outputCanvas.width * zoom));
+  const height = Math.max(1, Math.round(outputCanvas.height * zoom));
   el.resultCanvas.hidden = false;
   if (el.resultCanvas.width !== width || el.resultCanvas.height !== height) {
     el.resultCanvas.width = width;
@@ -1348,7 +1634,88 @@ function drawResultScaled() {
   context.clearRect(0, 0, width, height);
   context.drawImage(outputCanvas, 0, 0, width, height);
   paintSwatchHighlight(context);
-  el.resultTip.textContent = `${zoom}× 最近邻放大 · 实际 ${outputCanvas.width}×${outputCanvas.height}`;
+  el.resultTip.textContent = `${formatResultZoom(zoom)} 最近邻放大 · 实际 ${outputCanvas.width}×${outputCanvas.height}`;
+  syncResultZoomControls();
+}
+
+/** 连续结果缩放：以指针（或视口中心）为锚点，调整后保持该点不动。 */
+function setResultZoom(value, anchor = null) {
+  if (!outputCanvas || !state.source) return;
+  const next = clampResultZoom(value);
+  if (Math.abs(next - state.resultZoom) < 1e-6) {
+    syncResultZoomControls();
+    return;
+  }
+
+  const scroll = el.resultScroll;
+  const oldRect = el.resultCanvas.getBoundingClientRect();
+  const scrollRect = scroll.getBoundingClientRect();
+  const anchorX = anchor?.clientX ?? scrollRect.left + scroll.clientWidth / 2;
+  const anchorY = anchor?.clientY ?? scrollRect.top + scroll.clientHeight / 2;
+  const relativeX = oldRect.width ? clamp((anchorX - oldRect.left) / oldRect.width, 0, 1) : 0.5;
+  const relativeY = oldRect.height ? clamp((anchorY - oldRect.top) / oldRect.height, 0, 1) : 0.5;
+
+  // 反向高亮的掩码与旧画布尺寸绑定，换挡前清除，避免被按新尺寸拉伸。
+  clearSwatchHighlight(false);
+  state.resultZoom = next;
+  drawResultScaled();
+
+  const newRect = el.resultCanvas.getBoundingClientRect();
+  scroll.scrollLeft += (newRect.left + relativeX * newRect.width) - anchorX;
+  scroll.scrollTop += (newRect.top + relativeY * newRect.height) - anchorY;
+}
+
+function nudgeResultZoom(direction) {
+  if (!outputCanvas || !state.source) return;
+  const factor = direction > 0 ? 1.25 : 0.8;
+  setResultZoom(state.resultZoom * factor);
+}
+
+function commitResultZoomInput() {
+  if (!el.resultZoomInput) return;
+  const next = parseResultZoomInput(el.resultZoomInput.value, state.resultZoom);
+  el.resultZoomInput.value = formatResultZoom(next);
+  setResultZoom(next);
+}
+
+function fitResultToView() {
+  if (!outputCanvas || !state.source) return;
+  const zoom = fitResultZoom(
+    outputCanvas.width,
+    outputCanvas.height,
+    el.resultScroll.clientWidth,
+    el.resultScroll.clientHeight,
+  );
+  setResultZoom(zoom);
+  centerResultScroll();
+}
+
+function onResultWheel(event) {
+  if (!outputCanvas || !state.source) return;
+  event.preventDefault();
+  const factor = wheelZoomFactor(event.deltaY, { shift: event.shiftKey });
+  if (factor === 1) return;
+  if (pendingResultWheel) {
+    pendingResultWheel.factor *= factor;
+    pendingResultWheel.clientX = event.clientX;
+    pendingResultWheel.clientY = event.clientY;
+  } else {
+    pendingResultWheel = { factor, clientX: event.clientX, clientY: event.clientY };
+  }
+  if (resultWheelQueued) return;
+  resultWheelQueued = true;
+  requestAnimationFrame(flushResultWheelZoom);
+}
+
+function flushResultWheelZoom() {
+  resultWheelQueued = false;
+  const pending = pendingResultWheel;
+  pendingResultWheel = null;
+  if (!pending) return;
+  setResultZoom(state.resultZoom * pending.factor, {
+    clientX: pending.clientX,
+    clientY: pending.clientY,
+  });
 }
 
 function centerResultScroll() {
@@ -1707,28 +2074,14 @@ function refreshRecolorOnly() {
   updateTimingText();
 }
 
-function pushHistory(snapshot) {
-  recolorHistory.push({ ...snapshot });
-  if (recolorHistory.length > MAX_UNDO) recolorHistory.shift();
-  updateActionAvailability();
-}
-
-function undoRecolor() {
-  if (!recolorHistory.length) return;
-  state.recolorMap = recolorHistory.pop();
-  markDirty();
-  refreshRecolorOnly();
-  updateActionAvailability();
-  showToast('已撤销上一次改色');
-}
-
 function resetRecolor() {
   if (!Object.keys(state.recolorMap).length) return;
-  pushHistory(state.recolorMap);
-  state.recolorMap = {};
-  markDirty();
-  refreshRecolorOnly();
-  updateActionAvailability();
+  recordEdit('还原配色', () => {
+    state.recolorMap = {};
+    markDirty();
+    refreshRecolorOnly();
+    updateActionAvailability();
+  });
   showToast('已还原为自动配色');
 }
 
@@ -1737,7 +2090,6 @@ function openPalettePicker(index) {
   if (!entry) return;
   pickerSession = {
     sourceHex: entry.sourceHex,
-    snapshot: { ...state.recolorMap },
     changed: false,
   };
   el.colorPicker.value = entry.hex;
@@ -1755,17 +2107,18 @@ function importHexFile(file) {
       showToast('文件中没有有效的 HEX 颜色，请检查文件内容。', 'error');
       return;
     }
-    pushHistory(state.recolorMap);
-    state.recolorMap = {};
-    const auto = cache.quantized.palette;
-    const count = Math.min(colors.length, auto.length);
-    for (let i = 0; i < count; i += 1) {
-      const sourceHex = auto[i].hex;
-      if (colors[i] !== sourceHex) state.recolorMap[sourceHex] = colors[i];
-    }
-    markDirty();
-    refreshRecolorOnly();
-    showToast(`已导入 ${colors.length} 个颜色，按顺序替换前 ${count} 个自动配色。`, 'success');
+    recordEdit('导入 HEX 配色', () => {
+      state.recolorMap = {};
+      const auto = cache.quantized.palette;
+      const count = Math.min(colors.length, auto.length);
+      for (let i = 0; i < count; i += 1) {
+        const sourceHex = auto[i].hex;
+        if (colors[i] !== sourceHex) state.recolorMap[sourceHex] = colors[i];
+      }
+      markDirty();
+      refreshRecolorOnly();
+      showToast(`已导入 ${colors.length} 个颜色，按顺序替换前 ${count} 个自动配色。`, 'success');
+    });
   }).catch((error) => {
     console.error(error);
     showToast(`读取调色盘失败：${error.message}。请检查文件内容。`, 'error');
@@ -1870,7 +2223,12 @@ function updateActionAvailability() {
   el.btnExportPalette.disabled = !hasSource || !hasResult;
   el.btnImportHex.disabled = !hasSource || !hasResult;
   el.btnExportHex.disabled = !hasSource || !hasResult;
-  el.btnUndoRecolor.disabled = recolorHistory.length === 0;
+  const undoLabel = editHistory.peekUndo();
+  const redoLabel = editHistory.peekRedo();
+  el.btnUndo.disabled = !undoLabel;
+  el.btnRedo.disabled = !redoLabel;
+  el.btnUndo.title = undoLabel ? `撤销：${undoLabel}（Ctrl+Z）` : '撤销（Ctrl+Z）';
+  el.btnRedo.title = redoLabel ? `重做：${redoLabel}（Ctrl+Shift+Z）` : '重做（Ctrl+Shift+Z）';
   el.btnResetRecolor.disabled = Object.keys(state.recolorMap).length === 0;
 }
 
@@ -1961,7 +2319,7 @@ function syncAllControls() {
   el.ditherToggle.checked = state.dither;
   el.exportScale.value = String(state.exportScale);
   el.hoverHighlight.checked = state.hoverHighlight;
-  syncResultZoomButtons();
+  syncResultZoomControls();
   updateExportMeta();
   updateActionAvailability();
 }
@@ -2007,9 +2365,20 @@ function updateThresholdUI() {
   timelineValue(el.thresholdRange, state.threshold);
 }
 
+function syncResultZoomControls() {
+  if (el.resultZoomInput && document.activeElement !== el.resultZoomInput) {
+    el.resultZoomInput.value = formatResultZoom(state.resultZoom);
+  }
+  if (el.resultZoomRange) el.resultZoomRange.value = String(resultZoomToSlider(state.resultZoom));
+  syncResultZoomButtons();
+}
+
 function syncResultZoomButtons() {
   for (const button of el.resultZoomGroup.querySelectorAll('button[data-zoom]')) {
-    button.classList.toggle('is-active', Number(button.dataset.zoom) === state.resultZoom);
+    const zoom = Number(button.dataset.zoom);
+    const active = Math.abs(zoom - state.resultZoom) < 1e-3;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
   }
 }
 
@@ -2142,6 +2511,7 @@ function makeProjectText() {
       exportScale: state.exportScale,
       // 源图缩放百分比：恢复时优先使用，旧工程缺省时由 transform.scale 推导。
       sourceZoom: Math.round(zoomPercent(state.transform.scale) * 100) / 100,
+      splitMode: state.splitMode,
       hoverHighlight: state.hoverHighlight,
     },
   }, {
@@ -2258,7 +2628,13 @@ function onKeyDown(event) {
   }
   if (key === 'z' && !editing) {
     event.preventDefault();
-    undoRecolor();
+    if (event.shiftKey) redoEdit();
+    else undoEdit();
+    return;
+  }
+  if (key === 'y' && !editing) {
+    event.preventDefault();
+    redoEdit();
   }
 }
 
@@ -2282,6 +2658,8 @@ function getDebugState() {
     colorSpatial: state.colorSpatial,
     recolorMap: { ...state.recolorMap },
     resultZoom: state.resultZoom,
+    splitMode: state.splitMode,
+    effectiveSplitMode: appliedSplitMode,
     hoverHighlight: state.hoverHighlight,
     colors: finalPalette.length,
     approximate: Boolean(cache.quantized?.approximate),
@@ -2372,11 +2750,22 @@ function exposeDebugApi() {
       return getDebugState();
     },
     resetPalette() {
-      state.recolorMap = {};
-      recolorHistory.length = 0;
-      markDirty();
-      refreshRecolorOnly();
+      recordEdit('还原配色', () => {
+        state.recolorMap = {};
+        markDirty();
+        refreshRecolorOnly();
+      });
       return getDebugState();
+    },
+    undo: undoEdit,
+    redo: redoEdit,
+    getHistoryState() {
+      return {
+        undo: editHistory.undoCount(),
+        redo: editHistory.redoCount(),
+        undoLabel: editHistory.peekUndo(),
+        redoLabel: editHistory.peekRedo(),
+      };
     },
     getTimings: () => ({ ...lastTimings }),
     getHoverState() {

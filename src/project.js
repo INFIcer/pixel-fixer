@@ -3,6 +3,7 @@
 
 import { normalizeHex } from './color.js';
 import { isValidResample } from './resample.js';
+import { clampResultZoom, normalizeSplitMode } from './uistate.js';
 
 export const PROJECT_VERSION = 1;
 
@@ -74,10 +75,12 @@ function normalizeUi(value, fallbackScale = 1) {
   const zoom = Number(ui.resultZoom);
   const exportScale = Number(ui.exportScale);
   return {
-    resultZoom: [1, 4, 8].includes(zoom) ? zoom : 4,
+    // 结果预览倍率：0.25~8 连续，旧工程的 1/4/8 档位照常兼容。
+    resultZoom: clampResultZoom(Number.isFinite(zoom) ? zoom : 4),
+    splitMode: normalizeSplitMode(ui.splitMode),
     lockAspect: Boolean(ui.lockAspect),
     exportScale: [1, 2, 4, 8, 16].includes(exportScale) ? exportScale : 1,
-    // 源图缩放百分比（10~1600）：与 transform.scale 对应，便于阅读与恢复。
+    // 源图缩放百分比（1~6400）：与 transform.scale 对应，便于阅读与恢复。
     sourceZoom: zoomPercentValue(ui.sourceZoom, fallbackScale),
     // 调色盘联动开关：只有明确写入 false 才关闭；旧工程缺省视为开启。
     hoverHighlight: ui.hoverHighlight !== false,

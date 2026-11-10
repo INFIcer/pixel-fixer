@@ -264,7 +264,7 @@ export const WHEEL_ZOOM_FINE = 0.25;
 /** 预览区留白，与 app.js 绘制裁切框时使用的边距一致。 */
 export const ZOOM_FRAME_PADDING = 28;
 
-/** 把缩放值夹到 10%~1600%；非法值回退到 100%。 */
+/** 把缩放值夹到 1%~6400%；非法值回退到 100%。 */
 export function clampZoom(scale) {
   return clampScale(scale);
 }
@@ -292,7 +292,7 @@ export function formatZoomPercent(scale) {
   return `${Math.round(percent)}%`;
 }
 
-/** 百分比 → 缩放值（夹到 10%~1600%）。 */
+/** 百分比 → 缩放值（夹到 1%~6400%）。 */
 export function zoomFromPercent(percent) {
   const value = Number(percent);
   if (!Number.isFinite(value)) return 1;
@@ -301,7 +301,7 @@ export function zoomFromPercent(percent) {
 
 /**
  * 解析百分比输入框：允许 "137%"、"137"、" 137.5 % "，空值或非数字回退到 fallback。
- * 越界值直接夹到 10%~1600%（例如 5000% → 1600%，0% → 10%）。
+ * 越界值直接夹到 1%~6400%（例如 10000% → 6400%，0% → 1%）。
  */
 export function parseZoomInput(text, fallbackScale = 1) {
   const fallback = clampZoom(fallbackScale);
@@ -339,6 +339,97 @@ export function sliderToZoom(value) {
   return zoomFromPercent(sliderToPercent(value));
 }
 
+/* ---------- 结果预览缩放：25%~800%，无级连续 ---------- */
+
+/** 结果预览的显示倍率范围，与源图裁切缩放相互独立。 */
+export const RESULT_ZOOM_MIN = 0.25;
+export const RESULT_ZOOM_MAX = 8;
+export const RESULT_ZOOM_MIN_PERCENT = RESULT_ZOOM_MIN * 100;
+export const RESULT_ZOOM_MAX_PERCENT = RESULT_ZOOM_MAX * 100;
+export const RESULT_ZOOM_SLIDER_MAX = 1000;
+export const RESULT_ZOOM_PADDING = 32;
+
+/** 把结果预览倍率夹到 25%~800%；非法值回退到 100%。 */
+export function clampResultZoom(zoom) {
+  if (zoom === '' || zoom === null || zoom === undefined) return 1;
+  const value = Number(zoom);
+  if (!Number.isFinite(value)) return 1;
+  return clamp(value, RESULT_ZOOM_MIN, RESULT_ZOOM_MAX);
+}
+
+/** 结果倍率 → 百分比展示，复用源图缩放的量级规则。 */
+export function formatResultZoom(zoom) {
+  return formatZoomPercent(clampResultZoom(zoom));
+}
+
+/** 百分比 → 结果倍率。 */
+export function resultZoomFromPercent(percent) {
+  return clampResultZoom(Number(percent) / 100);
+}
+
+/** 解析结果预览的百分比输入，允许 "137%"、"137"、" 137.5 % "。 */
+export function parseResultZoomInput(text, fallbackZoom = 1) {
+  const fallback = clampResultZoom(fallbackZoom);
+  const raw = String(text ?? '').replace(/[%\s]/g, '').replace(',', '.');
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return fallback;
+  return resultZoomFromPercent(value);
+}
+
+/** 结果倍率 → 对数滑块位置（0~1000）。 */
+export function resultZoomToSlider(zoom) {
+  const percent = clampResultZoom(zoom) * 100;
+  const ratio = Math.log(percent / RESULT_ZOOM_MIN_PERCENT)
+    / Math.log(RESULT_ZOOM_MAX_PERCENT / RESULT_ZOOM_MIN_PERCENT);
+  return clamp(ratio * RESULT_ZOOM_SLIDER_MAX, 0, RESULT_ZOOM_SLIDER_MAX);
+}
+
+/** 对数滑块位置 → 结果倍率。 */
+export function sliderToResultZoom(value) {
+  const numeric = Number(value);
+  const safe = Number.isFinite(numeric) ? numeric : 0;
+  const ratio = clamp(safe, 0, RESULT_ZOOM_SLIDER_MAX) / RESULT_ZOOM_SLIDER_MAX;
+  const percent = RESULT_ZOOM_MIN_PERCENT
+    * (RESULT_ZOOM_MAX_PERCENT / RESULT_ZOOM_MIN_PERCENT) ** ratio;
+  return resultZoomFromPercent(percent);
+}
+
+/** 结果画面适应窗口：按可用视口与输出尺寸求倍率。 */
+export function fitResultZoom(outputWidth, outputHeight, viewportWidth, viewportHeight, padding = RESULT_ZOOM_PADDING) {
+  const ow = Number(outputWidth);
+  const oh = Number(outputHeight);
+  const vw = Number(viewportWidth);
+  const vh = Number(viewportHeight);
+  const pad = Math.max(0, Number(padding) || 0);
+  if (!(ow > 0) || !(oh > 0) || !(vw > 0) || !(vh > 0)) return 1;
+  const availableW = vw - pad * 2;
+  const availableH = vh - pad * 2;
+  if (!(availableW > 0) || !(availableH > 0)) return 1;
+  return clampResultZoom(Math.min(availableW / ow, availableH / oh));
+}
+
+/* ---------- 预览分割模式 ---------- */
+
+export const SPLIT_MODES = ['side', 'stack'];
+/** 中心预览窄于该宽度时，左右分割会挤成两条细缝，自动改为上下。 */
+export const SPLIT_MIN_WIDTH = 760;
+
+export function normalizeSplitMode(value) {
+  return value === 'stack' ? 'stack' : 'side';
+}
+
+/**
+ * 实际生效的分割方式：用户选左右但视口不够宽时退化为上下；
+ * 用户主动选上下时始终保持上下。
+ */
+export function resolveSplitMode(requested, viewportWidth, minWidth = SPLIT_MIN_WIDTH) {
+  const mode = normalizeSplitMode(requested);
+  const width = Number(viewportWidth);
+  if (mode === 'side' && Number.isFinite(width) && width < minWidth) return 'stack';
+  return mode;
+}
+
 /**
  * 滚轮缩放因子：factor = exp(-deltaY * 0.0015 * (shift ? 0.25 : 1))。
  * 连续指数缩放不会在挡位之间跳变；无效 deltaY 返回 1（不动）。
@@ -356,7 +447,7 @@ export function zoomStepFactor(fine = false) {
 }
 
 /**
- * 单次 +/- 微调。direction > 0 放大，< 0 缩小；结果夹在 10%~1600%。
+ * 单次 +/- 微调。direction > 0 放大，< 0 缩小；结果夹在 1%~6400%。
  * @param {number} scale 当前缩放
  * @param {number} direction 方向（通常为 +1 / -1）
  * @param {boolean} [fine] 是否精调（Shift）
