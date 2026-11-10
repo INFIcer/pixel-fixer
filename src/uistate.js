@@ -42,9 +42,129 @@ export function formatPercent(ratio) {
   return '100%';
 }
 
+/* ---------- 输出宽高输入（输入中不钳制，提交时才规范化） ---------- */
+
+/** 输出尺寸的合法范围，与 engine.js 的 normalizeOutputSize 保持一致。 */
+export const CROP_SIZE_MIN = 8;
+export const CROP_SIZE_MAX = 512;
+
+/**
+ * 解析宽/高输入框里的文本。输入过程中允许空值、暂时不合法的中间态，
+ * 这里只做“能不能读成一个数”的判断，不钳制、不回写。
+ * @returns {{valid:boolean, value:number|null, empty:boolean}}
+ */
+export function parseCropSizeInput(text) {
+  const raw = String(text ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/,/g, '.')
+    .replace(/px$/, '');
+  if (!raw) return { valid: false, value: null, empty: true };
+  if (!/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(raw)) return { valid: false, value: null, empty: false };
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return { valid: false, value: null, empty: false };
+  return { valid: true, value, empty: false };
+}
+
+/** 把数值规范化为 8~512 的整数；非法值回退到 fallback（同样会被规范化）。 */
+export function normalizeCropSize(value, fallback = 64) {
+  const fallbackValue = Number.isFinite(Number(fallback)) ? Number(fallback) : 64;
+  return normalizeOutputSize(value, fallbackValue);
+}
+
+/**
+ * 提交一次宽/高编辑（失焦或回车时调用）。
+ * - 只按用户正在编辑的那一边联动，绝不改回用户刚输入的那一边；
+ * - 输入为空或不是数字时整体回退到当前值；
+ * - 合法但越界的数值夹到 8~512。
+ * @param {object} input
+ * @param {'width'|'height'} input.which 正在编辑的输入框
+ * @param {string} input.widthText 宽度输入框文本
+ * @param {string} input.heightText 高度输入框文本
+ * @param {number} input.currentWidth 当前宽度
+ * @param {number} input.currentHeight 当前高度
+ * @param {number} input.ratio 锁定时的宽高比（宽 / 高）
+ * @param {boolean} input.lockAspect 是否锁定宽高比
+ * @returns {{width:number,height:number,changed:boolean,invalid:boolean}}
+ */
+export function resolveCropSizeEdit(input = {}) {
+  const which = input.which === 'height' ? 'height' : 'width';
+  const currentWidth = normalizeCropSize(input.currentWidth, 64);
+  const currentHeight = normalizeCropSize(input.currentHeight, 64);
+  const parsedWidth = parseCropSizeInput(input.widthText ?? String(currentWidth));
+  const parsedHeight = parseCropSizeInput(input.heightText ?? String(currentHeight));
+  const edited = which === 'height' ? parsedHeight : parsedWidth;
+
+  if (!edited.valid) {
+    return {
+      width: currentWidth,
+      height: currentHeight,
+      changed: false,
+      invalid: true,
+    };
+  }
+
+  let width = currentWidth;
+  let height = currentHeight;
+  const safeRatio = Number(input.ratio);
+
+  if (which === 'width') {
+    width = normalizeCropSize(edited.value, currentWidth);
+    if (input.lockAspect && Number.isFinite(safeRatio) && safeRatio > 0) {
+      height = normalizeCropSize(width / safeRatio, currentHeight);
+    } else if (parsedHeight.valid) {
+      height = normalizeCropSize(parsedHeight.value, currentHeight);
+    }
+  } else {
+    height = normalizeCropSize(edited.value, currentHeight);
+    if (input.lockAspect && Number.isFinite(safeRatio) && safeRatio > 0) {
+      width = normalizeCropSize(height * safeRatio, currentWidth);
+    } else if (parsedWidth.valid) {
+      width = normalizeCropSize(parsedWidth.value, currentWidth);
+    }
+  }
+
+  return {
+    width,
+    height,
+    changed: width !== currentWidth || height !== currentHeight,
+    invalid: false,
+  };
+}
+
+/** Esc 取消：恢复进入输入框时记录的宽高。 */
+export function restoreCropSizeSnapshot(snapshot, fallbackWidth = 64, fallbackHeight = 64) {
+  return {
+    width: normalizeCropSize(snapshot?.width, fallbackWidth),
+    height: normalizeCropSize(snapshot?.height, fallbackHeight),
+  };
+}
+
+/**
+ * 加/减按钮（或方向键）的即时步进：基于当前已提交值计算，不读取输入框里的中间态。
+ */
+export function stepCropSize(input = {}) {
+  const which = input.which === 'height' ? 'height' : 'width';
+  const currentWidth = normalizeCropSize(input.currentWidth, 64);
+  const currentHeight = normalizeCropSize(input.currentHeight, 64);
+  const delta = Math.round(Number(input.delta) || 0);
+  const nextWidth = which === 'width' ? currentWidth + delta : currentWidth;
+  const nextHeight = which === 'height' ? currentHeight + delta : currentHeight;
+  return resolveCropSizeEdit({
+    which,
+    widthText: String(nextWidth),
+    heightText: String(nextHeight),
+    currentWidth,
+    currentHeight,
+    ratio: input.ratio,
+    lockAspect: Boolean(input.lockAspect),
+  });
+}
+
 /**
  * 锁定宽高比时的尺寸联动。
- * 与直接取整可能产生 1px 误差，因此再次校正一次，保证结果尽量贴近比例。
+ * 只按正在编辑的那一边推导另一边，不再反过来修正用户刚输入的值。
  * @param {'width'|'height'} which 用户正在编辑的输入框
  * @param {number} width 输入框里的宽度值
  * @param {number} height 输入框里的高度值
@@ -54,25 +174,29 @@ export function formatPercent(ratio) {
  * @returns {{width:number,height:number}}
  */
 export function applyAspectLock(which, width, height, ratio, fallbackWidth = 64, fallbackHeight = 64) {
-  let nextWidth = normalizeOutputSize(width, fallbackWidth);
-  let nextHeight = normalizeOutputSize(height, fallbackHeight);
+  const parsedWidth = parseCropSizeInput(String(width));
+  const parsedHeight = parseCropSizeInput(String(height));
+  const baseWidth = parsedWidth.valid
+    ? normalizeCropSize(parsedWidth.value, fallbackWidth)
+    : normalizeCropSize(fallbackWidth, 64);
+  const baseHeight = parsedHeight.valid
+    ? normalizeCropSize(parsedHeight.value, fallbackHeight)
+    : normalizeCropSize(fallbackHeight, 64);
   const safeRatio = Number(ratio);
   if (!Number.isFinite(safeRatio) || safeRatio <= 0) {
-    return { width: nextWidth, height: nextHeight };
+    return { width: baseWidth, height: baseHeight };
   }
 
-  if (which === 'width') {
-    nextHeight = normalizeOutputSize(nextWidth / safeRatio, nextHeight);
-    if (Math.abs(nextWidth / nextHeight - safeRatio) > 0.75) {
-      nextWidth = normalizeOutputSize(nextHeight * safeRatio, nextWidth);
-    }
-  } else {
-    nextWidth = normalizeOutputSize(nextHeight * safeRatio, nextWidth);
-    if (Math.abs(nextWidth / nextHeight - safeRatio) > 0.75) {
-      nextHeight = normalizeOutputSize(nextWidth / safeRatio, nextHeight);
-    }
+  if (which === 'height') {
+    return {
+      width: normalizeCropSize(baseHeight * safeRatio, baseWidth),
+      height: baseHeight,
+    };
   }
-  return { width: nextWidth, height: nextHeight };
+  return {
+    width: baseWidth,
+    height: normalizeCropSize(baseWidth / safeRatio, baseHeight),
+  };
 }
 
 /**

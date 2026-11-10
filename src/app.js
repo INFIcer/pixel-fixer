@@ -34,7 +34,6 @@ import {
   clamp,
 } from './color.js';
 import {
-  applyAspectLock,
   aspectLabel,
   buildExportMeta,
   clampZoom,
@@ -46,7 +45,10 @@ import {
   formatZoomPercent,
   parseZoomInput,
   rangeProgress,
+  resolveCropSizeEdit,
+  restoreCropSizeSnapshot,
   sliderToZoom,
+  stepCropSize,
   stepZoom,
   wheelZoomFactor,
   zoomAroundPoint,
@@ -120,7 +122,8 @@ let toastTimer = null;
 let outputCanvas = null;
 let outputImageData = null;
 let lastTimings = { resample: 0, quantize: 0, compose: 0, total: 0 };
-let outputTimer = null;
+// 宽/高输入框的编辑会话：输入过程中只改文本，提交时才写回状态。
+let sizeEdit = null;
 // 滚轮缩放按帧合并：同一帧内的多个 wheel 事件只重绘 / 重建一次。
 let pendingWheelZoom = null;
 let wheelZoomQueued = false;
@@ -471,54 +474,59 @@ function bindEvents() {
 }
 
 function setupOutputInput(input, which) {
-  const commit = () => {
-    if (outputTimer) {
-      clearTimeout(outputTimer);
-      outputTimer = null;
-    }
-    applyOutputFromInputs(which);
-  };
-  input.addEventListener('input', () => {
-    if (outputTimer) clearTimeout(outputTimer);
-    outputTimer = setTimeout(commit, 180);
+  // 编辑期间不提交、不钳制、不回写：允许暂时空值或半截数字。
+  input.addEventListener('focus', () => {
+    sizeEdit = {
+      which,
+      width: state.transform.outputWidth,
+      height: state.transform.outputHeight,
+      cancelled: false,
+      committed: false,
+    };
+    input.select();
   });
-  input.addEventListener('change', commit);
-  input.addEventListener('blur', () => {
-    // 输入非法时恢复显示，避免留下空框。
-    if (!Number.isFinite(Number(input.value)) || Number(input.value) < 8 || Number(input.value) > 512) {
-      syncOutputInputs();
+
+  input.addEventListener('input', () => {
+    // 仅保留文本，等失焦 / 回车时再统一规范化。
+  });
+
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      commitSizeEdit(which);
+      input.blur();
+      return;
     }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      cancelSizeEdit();
+      input.blur();
+      return;
+    }
+    // 数字输入框的加/减方向键仍然即时生效；Shift 一次 10。
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      event.preventDefault();
+      const delta = (event.key === 'ArrowUp' ? 1 : -1) * (event.shiftKey ? 10 : 1);
+      stepSizeEdit(which, delta);
+    }
+  });
+
+  // 原生数字微调按钮（加/减）会立即触发 change；手动输入只在失焦时触发。
+  input.addEventListener('change', () => {
+    if (!sizeEdit || sizeEdit.which !== which) return;
+    if (sizeEdit.cancelled || sizeEdit.committed) return;
+    commitSizeEdit(which);
+  });
+
+  input.addEventListener('blur', () => {
+    if (!sizeEdit || sizeEdit.which !== which) return;
+    if (!sizeEdit.cancelled && !sizeEdit.committed) commitSizeEdit(which);
+    sizeEdit = null;
   });
 }
 
-function applyOutputFromInputs(which) {
-  if (!state.source) {
-    syncOutputInputs();
-    return;
-  }
-  const widthValue = Number(el.outW.value);
-  const heightValue = Number(el.outH.value);
-  if (!Number.isFinite(widthValue) || !Number.isFinite(heightValue)) {
-    syncOutputInputs();
-    return;
-  }
-
-  let width = normalizeOutputSize(widthValue, state.transform.outputWidth);
-  let height = normalizeOutputSize(heightValue, state.transform.outputHeight);
-
-  if (state.lockAspect) {
-    const locked = applyAspectLock(
-      which,
-      width,
-      height,
-      state.aspectRatio || 1,
-      state.transform.outputWidth,
-      state.transform.outputHeight,
-    );
-    width = locked.width;
-    height = locked.height;
-  }
-
+/** 把一次尺寸提交应用到裁切状态（同时同步两个输入框）。 */
+function applyCropSizes(width, height) {
   state.transform.outputWidth = width;
   state.transform.outputHeight = height;
   const constrained = constrainTransform(
@@ -537,6 +545,59 @@ function applyOutputFromInputs(which) {
   markDirty();
   drawSourcePreview();
   scheduleRebuild(true);
+}
+
+/** 失焦 / 回车：规范化输入并按锁定比例联动，然后一次性写回。 */
+function commitSizeEdit(which) {
+  if (!state.source) {
+    syncOutputInputs();
+    return;
+  }
+  const result = resolveCropSizeEdit({
+    which,
+    widthText: el.outW.value,
+    heightText: el.outH.value,
+    currentWidth: state.transform.outputWidth,
+    currentHeight: state.transform.outputHeight,
+    ratio: state.lockAspect ? state.aspectRatio : 0,
+    lockAspect: state.lockAspect,
+  });
+  if (sizeEdit) sizeEdit.committed = true;
+  if (result.invalid) {
+    syncOutputInputs();
+    showToast('宽高需要是 8~512 的整数，已恢复为原来的数值。', 'error', 3200);
+    return;
+  }
+  if (result.changed) applyCropSizes(result.width, result.height);
+  else syncOutputInputs();
+}
+
+/** Esc：放弃本次编辑，恢复进入输入框时的状态。 */
+function cancelSizeEdit() {
+  if (!sizeEdit) return;
+  const snapshot = sizeEdit;
+  const restored = restoreCropSizeSnapshot(snapshot, state.transform.outputWidth, state.transform.outputHeight);
+  sizeEdit = { ...snapshot, cancelled: true, committed: true };
+  if (restored.width !== state.transform.outputWidth || restored.height !== state.transform.outputHeight) {
+    applyCropSizes(restored.width, restored.height);
+  } else {
+    syncOutputInputs();
+  }
+}
+
+/** 加/减按钮 / 方向键：基于已提交值立即生效，再同步两个输入框。 */
+function stepSizeEdit(which, delta) {
+  if (!state.source) return;
+  const result = stepCropSize({
+    which,
+    delta,
+    currentWidth: state.transform.outputWidth,
+    currentHeight: state.transform.outputHeight,
+    ratio: state.lockAspect ? state.aspectRatio : 0,
+    lockAspect: state.lockAspect,
+  });
+  if (result.changed) applyCropSizes(result.width, result.height);
+  else syncOutputInputs();
 }
 
 /* ---------- 导入 / 工程 ---------- */

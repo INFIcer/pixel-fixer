@@ -13,11 +13,16 @@ import {
   formatPercent,
   formatZoomPercent,
   gcd,
+  normalizeCropSize,
+  parseCropSizeInput,
   parseZoomInput,
   percentToSlider,
   rangeProgress,
+  resolveCropSizeEdit,
+  restoreCropSizeSnapshot,
   sliderToPercent,
   sliderToZoom,
+  stepCropSize,
   stepZoom,
   wheelZoomFactor,
   zoomAroundPoint,
@@ -68,6 +73,112 @@ test('锁定宽高比：非法输入回退且比例无效时原样返回', () =>
   assert.deepEqual(applyAspectLock('width', Number.NaN, Number.NaN, 1, 64, 48), { width: 64, height: 64 });
   assert.deepEqual(applyAspectLock('width', 100, 50, 0, 64, 64), { width: 100, height: 50 });
   assert.deepEqual(applyAspectLock('height', 100, 50, Number.NaN, 64, 64), { width: 100, height: 50 });
+});
+
+/* ---------- 宽/高输入框：输入中不钳制，提交时规范化 ---------- */
+
+test('输入中间态：解析不钳制、不回写，半截数字保持原样', () => {
+  // 用户刚敲下 "6"：解析结果就是 6，不会被提前改成 8 或别的值。
+  const partial = parseCropSizeInput('6');
+  assert.equal(partial.valid, true);
+  assert.equal(partial.value, 6);
+  assert.equal(normalizeCropSize(64, 64), 64);
+  // 空值与半截符号只是“暂不可提交”，不是错误状态。
+  assert.deepEqual(parseCropSizeInput(''), { valid: false, value: null, empty: true });
+  assert.deepEqual(parseCropSizeInput('  '), { valid: false, value: null, empty: true });
+  assert.equal(parseCropSizeInput('6.').value, 6);
+  assert.equal(parseCropSizeInput('6px').value, 6);
+  assert.equal(parseCropSizeInput('abc').valid, false);
+});
+
+test('输入提交：非法输入整体回退到当前值，合法输入才更新', () => {
+  const base = { currentWidth: 64, currentHeight: 48, ratio: 4 / 3, lockAspect: true };
+  const empty = resolveCropSizeEdit({ ...base, which: 'width', widthText: '', heightText: '48' });
+  assert.deepEqual(empty, { width: 64, height: 48, changed: false, invalid: true });
+  const bad = resolveCropSizeEdit({ ...base, which: 'height', widthText: '64', heightText: 'abc' });
+  assert.equal(bad.invalid, true);
+  assert.deepEqual({ width: bad.width, height: bad.height }, { width: 64, height: 48 });
+
+  const valid = resolveCropSizeEdit({ ...base, which: 'width', widthText: '96', heightText: '48' });
+  assert.deepEqual(valid, { width: 96, height: 72, changed: true, invalid: false });
+});
+
+test('锁定比例：编辑宽只改高，编辑高只改宽，绝不改回正在编辑的一边', () => {
+  const widthEdit = resolveCropSizeEdit({
+    which: 'width',
+    widthText: '65',
+    heightText: '48',
+    currentWidth: 64,
+    currentHeight: 48,
+    ratio: 4 / 3,
+    lockAspect: true,
+  });
+  assert.equal(widthEdit.width, 65);
+  assert.equal(widthEdit.height, 49);
+
+  const heightEdit = resolveCropSizeEdit({
+    which: 'height',
+    widthText: '64',
+    heightText: '96',
+    currentWidth: 64,
+    currentHeight: 48,
+    ratio: 4 / 3,
+    lockAspect: true,
+  });
+  assert.equal(heightEdit.height, 96);
+  assert.equal(heightEdit.width, 128);
+});
+
+test('边界钳制：宽高夹在 8~512', () => {
+  const huge = resolveCropSizeEdit({
+    which: 'width',
+    widthText: '9999',
+    heightText: '9999',
+    currentWidth: 64,
+    currentHeight: 64,
+    ratio: 1,
+    lockAspect: true,
+  });
+  assert.deepEqual(huge, { width: 512, height: 512, changed: true, invalid: false });
+
+  const tiny = resolveCropSizeEdit({
+    which: 'height',
+    widthText: '64',
+    heightText: '0',
+    currentWidth: 64,
+    currentHeight: 64,
+    ratio: 1,
+    lockAspect: true,
+  });
+  assert.deepEqual(tiny, { width: 8, height: 8, changed: true, invalid: false });
+
+  assert.equal(normalizeCropSize(-5, 64), 8);
+  assert.equal(normalizeCropSize(64.6, 64), 65);
+});
+
+test('Esc 取消：恢复进入输入框时的宽高', () => {
+  assert.deepEqual(restoreCropSizeSnapshot({ width: 64, height: 48 }), { width: 64, height: 48 });
+  // 编辑过程中被临时改过，也按快照恢复。
+  assert.deepEqual(
+    restoreCropSizeSnapshot({ width: 64, height: 48 }, 100, 100),
+    { width: 64, height: 48 },
+  );
+  assert.deepEqual(restoreCropSizeSnapshot(null, 100, 80), { width: 100, height: 80 });
+});
+
+test('加/减：基于已提交值即时步进，锁定比例时联动另一边', () => {
+  assert.deepEqual(
+    stepCropSize({ which: 'width', delta: 1, currentWidth: 64, currentHeight: 64, ratio: 1, lockAspect: true }),
+    { width: 65, height: 65, changed: true, invalid: false },
+  );
+  assert.deepEqual(
+    stepCropSize({ which: 'height', delta: -10, currentWidth: 64, currentHeight: 64, ratio: 4 / 3, lockAspect: true }),
+    { width: 72, height: 54, changed: true, invalid: false },
+  );
+  assert.deepEqual(
+    stepCropSize({ which: 'width', delta: 1, currentWidth: 512, currentHeight: 512, ratio: 1, lockAspect: true }),
+    { width: 512, height: 512, changed: false, invalid: false },
+  );
 });
 
 test('导出信息包含文件名、像素数与倍数尺寸', () => {
