@@ -49,6 +49,7 @@ test('工程对象字段完整且值被规范化', () => {
   assert.deepEqual(project.palette, ['#ff0000', '#00ff00']);
   assert.equal(project.transform.outputWidth, 64);
   assert.equal(project.transform.outputHeight, 48);
+  assert.equal(project.transform.scaleMode, 'pixel');
   assert.equal(project.ui.resultZoom, 8);
   assert.equal(project.ui.exportScale, 8);
   assert.equal(project.ui.lockAspect, true);
@@ -78,11 +79,13 @@ test('UI 缩放：保存/恢复 sourceZoom，旧工程按 transform.scale 回退
   raw.ui.sourceZoom = 250;
   assert.equal(parseProject(JSON.stringify(raw)).ui.sourceZoom, 250);
 
-  // 越界与非法值被夹到 10%~1600%。
+  // 越界与非法值被夹到 1%~6400%。
   raw.ui.sourceZoom = 5000;
-  assert.equal(parseProject(JSON.stringify(raw)).ui.sourceZoom, 1600);
+  assert.equal(parseProject(JSON.stringify(raw)).ui.sourceZoom, 5000);
+  raw.ui.sourceZoom = 9000;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.sourceZoom, 6400);
   raw.ui.sourceZoom = 0;
-  assert.equal(parseProject(JSON.stringify(raw)).ui.sourceZoom, 10);
+  assert.equal(parseProject(JSON.stringify(raw)).ui.sourceZoom, 1);
   raw.ui.sourceZoom = 'abc';
   assert.equal(parseProject(JSON.stringify(raw)).ui.sourceZoom, 175);
 
@@ -91,6 +94,17 @@ test('UI 缩放：保存/恢复 sourceZoom，旧工程按 transform.scale 回退
   delete oldRaw.ui.sourceZoom;
   oldRaw.transform.scale = 2.5;
   assert.equal(parseProject(JSON.stringify(oldRaw)).ui.sourceZoom, 250);
+});
+
+test('缩放口径：新工程写 pixel，旧工程缺省按 fit 识别', () => {
+  const project = example();
+  assert.equal(project.transform.scaleMode, 'pixel');
+  const raw = JSON.parse(serializeProject(project));
+  delete raw.transform.scaleMode;
+  const parsed = parseProject(JSON.stringify(raw));
+  assert.equal(parsed.transform.scaleMode, 'fit');
+  // 旧口径的值本身保留，由加载流程换算成新口径。
+  assert.equal(parsed.transform.scale, 1.75);
 });
 
 test('UI 联动开关：缺省开启，显式 false 保持关闭', () => {
@@ -152,7 +166,7 @@ test('尺寸与阈值被限制到合法范围', () => {
   const parsed = parseProject(JSON.stringify(raw));
   assert.equal(parsed.transform.outputWidth, 512);
   assert.equal(parsed.transform.outputHeight, 8);
-  assert.equal(parsed.transform.scale, 16);
+  assert.equal(parsed.transform.scale, 64);
   assert.equal(parsed.threshold, 100);
   assert.equal(parsed.maxColors, 256);
 });

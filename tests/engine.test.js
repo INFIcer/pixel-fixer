@@ -2,8 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  MAX_SCALE,
+  MIN_SCALE,
   computeCropRect,
   constrainTransform,
+  convertLegacyScale,
+  fitScale,
   resampleOutput,
   resolvePalette,
   composeOutput,
@@ -26,38 +30,56 @@ function makeImage(width, height, colorAt) {
   return { width, height, data };
 }
 
-test('裁剪几何：scale=1 取源图内最大输出宽高比区域', () => {
-  const rect = computeCropRect(1024, 768, 64, 64, 1, 0, 0);
-  assert.equal(rect.width, 768);
-  assert.equal(rect.height, 768);
-  assert.equal(rect.x, 128);
-  assert.equal(rect.y, 0);
-});
-
-test('裁剪几何：2x 缩放裁剪宽高减半，中心保持', () => {
-  const rect = computeCropRect(1024, 768, 64, 64, 2, 0, 0);
-  assert.equal(rect.width, 384);
-  assert.equal(rect.height, 384);
-  assert.equal(rect.x, 320);
-  assert.equal(rect.y, 192);
-});
-
-test('裁剪几何：竖图取最小边，垂直居中', () => {
-  const rect = computeCropRect(600, 1000, 64, 64, 1, 0, 0);
+test('像素 1:1：输出 64、源 1024、scale=1 时裁切 64×64', () => {
+  const rect = computeCropRect(1024, 1024, 64, 64, 1, 0, 0);
   assert.deepEqual(
     { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-    { x: 0, y: 200, width: 600, height: 600 },
+    { x: 480, y: 480, width: 64, height: 64 },
   );
 });
 
-test('裁剪几何：非 1:1 比例 + 偏移 + 缩放同时生效', () => {
+test('像素 1:1：scale 放大/缩小与裁切尺寸成反比', () => {
+  const doubled = computeCropRect(1024, 1024, 64, 64, 2, 0, 0);
+  assert.deepEqual(
+    { x: doubled.x, y: doubled.y, width: doubled.width, height: doubled.height },
+    { x: 496, y: 496, width: 32, height: 32 },
+  );
+  const halved = computeCropRect(1024, 1024, 64, 64, 0.5, 0, 0);
+  assert.deepEqual(
+    { x: halved.x, y: halved.y, width: halved.width, height: halved.height },
+    { x: 448, y: 448, width: 128, height: 128 },
+  );
+  const whole = computeCropRect(1024, 1024, 64, 64, 0.0625, 0, 0);
+  assert.deepEqual(
+    { x: whole.x, y: whole.y, width: whole.width, height: whole.height },
+    { x: 0, y: 0, width: 1024, height: 1024 },
+  );
+});
+
+test('像素 1:1：非方形输出与偏移同时生效', () => {
   const rect = computeCropRect(1024, 768, 64, 48, 2, 100, -50);
-  assert.equal(rect.width, 512);
-  assert.equal(rect.height, 384);
-  assert.equal(rect.x, 356);
-  assert.equal(rect.y, 142);
-  assert.equal(rect.fitWidth, 1024);
-  assert.equal(rect.fitHeight, 768);
+  assert.equal(rect.width, 32);
+  assert.equal(rect.height, 24);
+  assert.equal(rect.x, 596);
+  assert.equal(rect.y, 322);
+});
+
+test('缩放范围与适应窗口：0.01~64，1024 源图能整图取到', () => {
+  assert.equal(MIN_SCALE, 0.01);
+  assert.equal(MAX_SCALE, 64);
+  assert.equal(fitScale(1024, 1024, 64, 64), 0.0625);
+  assert.equal(fitScale(1024, 512, 64, 64), 0.0625);
+  assert.equal(fitScale(512, 512, 64, 64), 0.125);
+  // 输出 64 时，1% 对应 6400 源像素，足以覆盖 1024 源图。
+  assert.ok(64 / MIN_SCALE >= 1024);
+});
+
+test('旧工程缩放换算：旧 scale × 输出宽 / 适应框宽', () => {
+  // 1024×768、输出 64×64 的旧适应框是 768×768，factor = 64/768。
+  assert.ok(Math.abs(convertLegacyScale(1, 1024, 768, 64, 64) - 64 / 768) < 1e-12);
+  assert.ok(Math.abs(convertLegacyScale(2, 1024, 768, 64, 64) - 128 / 768) < 1e-12);
+  // 方形源图：适应框就是整图。
+  assert.equal(convertLegacyScale(1, 1024, 1024, 64, 64), 0.0625);
 });
 
 test('裁剪几何：非法尺寸抛出明确错误', () => {
@@ -65,26 +87,33 @@ test('裁剪几何：非法尺寸抛出明确错误', () => {
   assert.throws(() => computeCropRect(10, 10, 0, 64), /输出尺寸/);
 });
 
-test('偏移约束：裁剪框不会被移出源图', () => {
+test('偏移约束：裁剪框不会被移出源图，并标记已靠边', () => {
   const constrained = constrainTransform(1024, 768, 64, 64, 2, 9999, -9999);
   const rect = computeCropRect(1024, 768, 64, 64, constrained.scale, constrained.offsetX, constrained.offsetY);
   assert.ok(rect.x >= -1e-9);
   assert.ok(rect.y >= -1e-9);
   assert.ok(rect.x + rect.width <= 1024 + 1e-9);
   assert.ok(rect.y + rect.height <= 768 + 1e-9);
-  assert.equal(constrained.offsetX, 320);
-  assert.equal(constrained.offsetY, -192);
+  assert.equal(constrained.offsetX, 496);
+  assert.equal(constrained.offsetY, -368);
+  assert.equal(constrained.clamped, true);
 });
 
 test('偏移约束：裁剪框大于源图时允许源图在框内滑动', () => {
   const constrained = constrainTransform(100, 100, 512, 512, 0.25, 9999, -9999);
   const rect = computeCropRect(100, 100, 512, 512, constrained.scale, constrained.offsetX, constrained.offsetY);
-  assert.equal(rect.width, 400);
-  assert.equal(rect.height, 400);
-  assert.ok(rect.x <= 1e-9 && rect.x >= -300 - 1e-9);
-  assert.ok(rect.y <= 1e-9 && rect.y >= -300 - 1e-9);
-  assert.equal(constrained.offsetX, 150);
-  assert.equal(constrained.offsetY, -150);
+  assert.equal(rect.width, 2048);
+  assert.equal(rect.height, 2048);
+  assert.ok(rect.x <= 1e-9 && rect.x >= -1948 - 1e-9);
+  assert.ok(rect.y <= 1e-9 && rect.y >= -1948 - 1e-9);
+  assert.equal(constrained.offsetX, 974);
+  assert.equal(constrained.offsetY, -974);
+  assert.equal(constrained.clamped, true);
+});
+
+test('偏移约束：居中时不算被边界钳制', () => {
+  const constrained = constrainTransform(1024, 768, 64, 64, 1, 100, -50);
+  assert.equal(constrained.clamped, false);
 });
 
 test('resampleOutput：按变换裁出指定区域并重采样', () => {
@@ -98,15 +127,17 @@ test('resampleOutput：按变换裁出指定区域并重采样', () => {
   }, 'nearest');
   assert.deepEqual(
     { x: crop.x, y: crop.y, width: crop.width, height: crop.height },
-    { x: 2, y: 2, width: 4, height: 4 },
+    { x: 3, y: 3, width: 2, height: 2 },
   );
   assert.equal(image.width, 4);
   assert.equal(image.height, 4);
   for (let y = 0; y < 4; y += 1) {
     for (let x = 0; x < 4; x += 1) {
       const offset = (y * 4 + x) * 4;
-      assert.equal(image.data[offset], (x + 2) * 30);
-      assert.equal(image.data[offset + 1], (y + 2) * 30);
+      const sourceX = Math.min(7, 3 + Math.floor(x / 2));
+      const sourceY = Math.min(7, 3 + Math.floor(y / 2));
+      assert.equal(image.data[offset], sourceX * 30);
+      assert.equal(image.data[offset + 1], sourceY * 30);
       assert.equal(image.data[offset + 2], 0);
       assert.equal(image.data[offset + 3], 255);
     }
@@ -153,7 +184,8 @@ test('端到端算法链路：裁剪→64×64→阈值合并→改色→工程�
   });
 
   const transform = {
-    scale: 1,
+    // 8×8 源图放大到 64×64 输出：1 源像素 = 8 输出像素，scale 取 8。
+    scale: 8,
     offsetX: 0,
     offsetY: 0,
     outputWidth: 64,

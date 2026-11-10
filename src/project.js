@@ -66,7 +66,7 @@ function zoomPercentValue(value, fallbackScale) {
   const fallbackPercent = (Number(fallbackScale) || 1) * 100;
   const number = Number(value);
   const percent = Number.isFinite(number) ? number : fallbackPercent;
-  return Math.round(Math.max(10, Math.min(1600, percent)) * 100) / 100;
+  return Math.round(Math.max(1, Math.min(6400, percent)) * 100) / 100;
 }
 
 function normalizeUi(value, fallbackScale = 1) {
@@ -105,7 +105,10 @@ export function normalizeProject(raw) {
 
   const transformRaw = raw.transform && typeof raw.transform === 'object' ? raw.transform : {};
   const transform = {
-    scale: finiteNumber(transformRaw.scale, 1, 0.1, 16),
+    // 新语义：scale=1 表示像素 1:1，范围 1%~6400%。
+    // 旧工程没有 scaleMode，按 fit（相对适应框的倍数）识别，加载时自动换算。
+    scale: finiteNumber(transformRaw.scale, 1, 0.01, 64),
+    scaleMode: transformRaw.scaleMode === 'pixel' ? 'pixel' : 'fit',
     offsetX: finiteNumber(transformRaw.offsetX, 0, -100000, 100000),
     offsetY: finiteNumber(transformRaw.offsetY, 0, -100000, 100000),
     outputWidth: integer(transformRaw.outputWidth, 64, 8, 512),
@@ -156,7 +159,8 @@ export function createProject(input, options = {}) {
     sourceWidth: input?.sourceWidth,
     sourceHeight: input?.sourceHeight,
     sourceName: input?.sourceName,
-    transform: input?.transform,
+    // 新保存的工程固定写 pixel 口径；旧工程没有该字段时按 fit 处理。
+    transform: { ...(input?.transform || {}), scaleMode: 'pixel' },
     resample: input?.resample,
     colorMode: input?.colorMode,
     threshold: input?.threshold,

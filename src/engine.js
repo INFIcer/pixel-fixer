@@ -5,8 +5,8 @@ import { hexToRgb, normalizeHex } from './color.js';
 import { resample } from './resample.js';
 import { TRANSPARENT_INDEX } from './quantize.js';
 
-export const MIN_SCALE = 0.1;
-export const MAX_SCALE = 16;
+export const MIN_SCALE = 0.01;
+export const MAX_SCALE = 64;
 
 export function clampScale(scale) {
   const value = Number(scale);
@@ -22,26 +22,17 @@ export function normalizeOutputSize(value, fallback = 64) {
 
 /**
  * 计算裁剪区域（源图像素坐标）。
- * scale=1 时，裁剪框是源图内能放下的最大输出宽高比区域；
- * scale 越大裁剪越小（放大），offsetX/offsetY 是裁剪中心相对源图中心的偏移。
+ * 新语义：100%（scale=1）= 像素 1:1，即裁切框在源图上正好取输出尺寸那么大。
+ *   cropWidth = outputWidth / scale，cropHeight = outputHeight / scale
+ * scale>1 放大（裁切更小），scale<1 缩小（裁切更大）。
+ * offsetX/offsetY 是裁剪中心相对源图中心的偏移（源图像素）。
  */
 export function computeCropRect(sourceWidth, sourceHeight, outputWidth, outputHeight, scale = 1, offsetX = 0, offsetY = 0) {
   if (!(sourceWidth > 0) || !(sourceHeight > 0)) throw new TypeError('源图尺寸无效');
   if (!(outputWidth > 0) || !(outputHeight > 0)) throw new TypeError('输出尺寸无效');
-  const aspect = outputWidth / outputHeight;
-  let fitWidth;
-  let fitHeight;
-  if (sourceWidth / sourceHeight > aspect) {
-    fitHeight = sourceHeight;
-    fitWidth = sourceHeight * aspect;
-  } else {
-    fitWidth = sourceWidth;
-    fitHeight = sourceWidth / aspect;
-  }
-
   const safeScale = clampScale(scale);
-  const cropWidth = fitWidth / safeScale;
-  const cropHeight = fitHeight / safeScale;
+  const cropWidth = outputWidth / safeScale;
+  const cropHeight = outputHeight / safeScale;
   const centerX = sourceWidth / 2 + (Number(offsetX) || 0);
   const centerY = sourceHeight / 2 + (Number(offsetY) || 0);
 
@@ -50,9 +41,34 @@ export function computeCropRect(sourceWidth, sourceHeight, outputWidth, outputHe
     y: centerY - cropHeight / 2,
     width: cropWidth,
     height: cropHeight,
-    fitWidth,
-    fitHeight,
   };
+}
+
+/** 让整张源图落入裁切框的缩放值：min(输出宽/源宽, 输出高/源高)。 */
+export function fitScale(sourceWidth, sourceHeight, outputWidth, outputHeight) {
+  const sw = Number(sourceWidth);
+  const sh = Number(sourceHeight);
+  const ow = Number(outputWidth);
+  const oh = Number(outputHeight);
+  if (!(sw > 0) || !(sh > 0) || !(ow > 0) || !(oh > 0)) return 1;
+  return clampScale(Math.min(ow / sw, oh / sh));
+}
+
+/**
+ * 旧工程的缩放语义是“相对适应框的倍数”：scale=1 时裁切框是源图内最大的
+ * 输出宽高比矩形。换算成新语义（像素 1:1）：
+ *   newScale = oldScale × 输出宽 / 旧适应框宽
+ * offset 仍是源图像素偏移，含义不变。
+ */
+export function convertLegacyScale(legacyScale, sourceWidth, sourceHeight, outputWidth, outputHeight) {
+  const sw = Number(sourceWidth);
+  const sh = Number(sourceHeight);
+  const ow = Number(outputWidth);
+  const oh = Number(outputHeight);
+  if (!(sw > 0) || !(sh > 0) || !(ow > 0) || !(oh > 0)) return 1;
+  const aspect = ow / oh;
+  const fitWidth = sw / sh > aspect ? sh * aspect : sw;
+  return clampScale((Number(legacyScale) || 1) * (ow / fitWidth));
 }
 
 /**
@@ -77,6 +93,8 @@ export function constrainTransform(sourceWidth, sourceHeight, outputWidth, outpu
     scale: safeScale,
     offsetX: x + rect.width / 2 - sourceWidth / 2,
     offsetY: y + rect.height / 2 - sourceHeight / 2,
+    // 是否因为贴边被约束，界面用来给出“已尽量靠边”的书面提示。
+    clamped: Math.abs(x - rawX) > 1e-6 || Math.abs(y - rawY) > 1e-6,
   };
 }
 

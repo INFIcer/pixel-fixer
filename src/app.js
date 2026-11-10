@@ -6,6 +6,7 @@ import { createColorModel, quantize } from './quantize.js';
 import {
   computeCropRect,
   constrainTransform,
+  convertLegacyScale,
   resampleOutput,
   resolvePalette,
   composeOutput,
@@ -124,6 +125,8 @@ let outputImageData = null;
 let lastTimings = { resample: 0, quantize: 0, compose: 0, total: 0 };
 // 宽/高输入框的编辑会话：输入过程中只改文本，提交时才写回状态。
 let sizeEdit = null;
+// 裁切贴边提示的节流时间戳，避免拖动时反复弹出。
+let lastClampNotice = 0;
 // 滚轮缩放按帧合并：同一帧内的多个 wheel 事件只重绘 / 重建一次。
 let pendingWheelZoom = null;
 let wheelZoomQueued = false;
@@ -173,6 +176,23 @@ function showToast(message, type = 'info', duration = 3000) {
   toastTimer = setTimeout(() => {
     el.toast.classList.remove('is-visible');
   }, duration);
+}
+
+/** 只把 scale / offset 写回状态，避免把约束结果里的临时标记带进工程。 */
+function assignTransform(value) {
+  if (!value) return;
+  state.transform.scale = clampZoom(value.scale);
+  state.transform.offsetX = Number(value.offsetX) || 0;
+  state.transform.offsetY = Number(value.offsetY) || 0;
+}
+
+/** 裁切被源图边界约束时给出一次书面提示（4 秒内只提示一次）。 */
+function noticeCropClamped(constrained) {
+  if (!constrained || !constrained.clamped) return;
+  const now = Date.now();
+  if (now - lastClampNotice < 4000) return;
+  lastClampNotice = now;
+  showToast('裁切范围超出图像边界，已尽量靠边。', 'info', 2600);
 }
 
 function markDirty() {
@@ -538,7 +558,8 @@ function applyCropSizes(width, height) {
     state.transform.offsetX,
     state.transform.offsetY,
   );
-  Object.assign(state.transform, constrained);
+  assignTransform(constrained);
+  noticeCropClamped(constrained);
   syncOutputInputs();
   updateAspectLabel();
   updateSourceInfo();
@@ -761,8 +782,18 @@ async function loadProjectText(text, options = {}) {
     baseName: sanitizeBaseName(project.sourceName),
   };
 
-  // 缩放百分比以 ui.sourceZoom 为准（旧工程会由 transform.scale 推导）。
-  const restoredScale = clampZoom(project.ui.sourceZoom / 100);
+  // 新工程按 ui.sourceZoom 恢复；旧工程（scaleMode 缺失或为 fit）的
+  // transform.scale 是“相对适应框的倍数”，按新语义自动换算成像素 1:1。
+  const legacyScaleMode = project.transform.scaleMode !== 'pixel';
+  const restoredScale = legacyScaleMode
+    ? convertLegacyScale(
+      project.transform.scale,
+      imageData.width,
+      imageData.height,
+      project.transform.outputWidth,
+      project.transform.outputHeight,
+    )
+    : clampZoom(project.ui.sourceZoom / 100);
   const constrained = constrainTransform(
     imageData.width,
     imageData.height,
@@ -774,7 +805,9 @@ async function loadProjectText(text, options = {}) {
   );
 
   state.transform = {
-    ...constrained,
+    scale: constrained.scale,
+    offsetX: constrained.offsetX,
+    offsetY: constrained.offsetY,
     outputWidth: project.transform.outputWidth,
     outputHeight: project.transform.outputHeight,
   };
@@ -823,6 +856,9 @@ async function loadProjectText(text, options = {}) {
     }
   }
 
+  if (legacyScaleMode) {
+    showToast('旧工程的缩放已按新的 1:1 口径自动换算，如与预期不同可重新调整。', 'info', 5000);
+  }
   if (!options.quiet) showToast('工程已加载', 'success');
   return project;
 }
@@ -993,7 +1029,8 @@ function onPointerMove(event) {
     state.transform.offsetX,
     state.transform.offsetY,
   );
-  Object.assign(state.transform, constrained);
+  assignTransform(constrained);
+  noticeCropClamped(constrained);
   markDirty();
   updateSourceInfo();
   drawSourcePreview();
@@ -1067,7 +1104,8 @@ function flushWheelZoom() {
 
 /** 应用缩放结果：同步控件、按帧重绘预览与结果。 */
 function applyZoomTransform(transform) {
-  Object.assign(state.transform, transform);
+  assignTransform(transform);
+  noticeCropClamped(transform);
   syncZoomControls();
   markDirty();
   scheduleSourceDraw();
@@ -1113,14 +1151,11 @@ function resetZoomOneToOne() {
 /** 适应窗口：让整张源图落入预览区并居中。 */
 function fitSourceToView() {
   if (!state.source) return;
-  const rect = el.sourceWrap.getBoundingClientRect();
   const scale = fitZoom(
     state.source.width,
     state.source.height,
     state.transform.outputWidth,
     state.transform.outputHeight,
-    rect.width,
-    rect.height,
   );
   applySourceZoom(scale, 0, 0);
 }

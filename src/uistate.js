@@ -3,7 +3,13 @@
 
 import { clamp } from './color.js';
 import { buildExportFilename } from './exporter.js';
-import { computeCropRect, constrainTransform, normalizeOutputSize } from './engine.js';
+import {
+  clampScale,
+  computeCropRect,
+  constrainTransform,
+  fitScale,
+  normalizeOutputSize,
+} from './engine.js';
 
 /** 最大公约数，用于化简宽高比。 */
 export function gcd(a, b) {
@@ -238,13 +244,13 @@ export function rangeProgress(value, min, max) {
 
 /* ---------- 缩放数学（纯逻辑，app.js 与测试共用） ---------- */
 
-/** 缩放范围：10%~1600%，与 engine.js 的 MIN_SCALE / MAX_SCALE 保持一致。 */
-export const ZOOM_MIN = 0.1;
-export const ZOOM_MAX = 16;
+/** 缩放范围：1%~6400%，与 engine.js 的 MIN_SCALE / MAX_SCALE 保持一致。 */
+export const ZOOM_MIN = 0.01;
+export const ZOOM_MAX = 64;
 export const ZOOM_MIN_PERCENT = ZOOM_MIN * 100;
 export const ZOOM_MAX_PERCENT = ZOOM_MAX * 100;
 
-/** 对数滑块的内部刻度：0 对应 10%，1000 对应 1600%。 */
+/** 对数滑块的内部刻度：0 对应 1%，1000 对应 6400%。 */
 export const ZOOM_SLIDER_MAX = 1000;
 
 /** 微调按钮的倍率：普通 1.02，按住 Shift 时 1.005。 */
@@ -260,9 +266,7 @@ export const ZOOM_FRAME_PADDING = 28;
 
 /** 把缩放值夹到 10%~1600%；非法值回退到 100%。 */
 export function clampZoom(scale) {
-  const value = Number(scale);
-  if (!Number.isFinite(value)) return 1;
-  return clamp(value, ZOOM_MIN, ZOOM_MAX);
+  return clampScale(scale);
 }
 
 /** 缩放值 → 百分比数值（未取整，便于继续计算）。 */
@@ -271,11 +275,16 @@ export function zoomPercent(scale) {
 }
 
 /**
- * 百分比展示：低于 100% 时保留 1 位小数（10.5%），100% 以上取整（137%）。
+ * 百分比展示：1%~6400% 之间的有效数字随量级调整，100% 以上取整。
+ * 低倍率（<10%）保留 2 位小数，保证 6.25% 这类“整图缩进”不会显示成 6.3%。
  * 显示只影响文案，不改变真实缩放值。
  */
 export function formatZoomPercent(scale) {
   const percent = zoomPercent(scale);
+  if (percent < 10) {
+    const rounded = Math.round(percent * 100) / 100;
+    return `${Number.isInteger(rounded) ? rounded.toFixed(0) : String(rounded)}%`;
+  }
   if (percent < 100) {
     const rounded = Math.round(percent * 10) / 10;
     return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}%`;
@@ -401,38 +410,13 @@ export function computeFrame(viewportWidth, viewportHeight, aspect, padding = ZO
 }
 
 /**
- * “适应窗口”的缩放值：让整张源图都落在预览画布内。
- * 推导：viewScale = frame.width / crop.width = frame.width * scale / fitWidth，
- * 因此源图显示尺寸 = 源图尺寸 * frame.width * scale / fitWidth；
- * 分别对宽、高解出上限，取较小者，最后夹到 10%~1600%。
+ * “适应窗口”的缩放值：让整张源图落进裁切框。
+ * 新语义下与预览画布大小无关，只由源图和输出尺寸决定：
+ *   scale = min(输出宽 / 源宽, 输出高 / 源高)
+ * 例如 1024×1024 源图、64×64 输出 → 6.25%。
  */
-export function fitZoom(
-  sourceWidth,
-  sourceHeight,
-  outputWidth,
-  outputHeight,
-  viewportWidth,
-  viewportHeight,
-  padding = ZOOM_FRAME_PADDING,
-) {
-  const sw = Number(sourceWidth);
-  const sh = Number(sourceHeight);
-  const ow = Number(outputWidth);
-  const oh = Number(outputHeight);
-  if (!(sw > 0) || !(sh > 0) || !(ow > 0) || !(oh > 0)) return 1;
-
-  const aspect = ow / oh;
-  const frame = computeFrame(viewportWidth, viewportHeight, aspect, padding);
-  if (!(frame.width > 0)) return 1;
-
-  const fit = computeCropRect(sw, sh, ow, oh, 1, 0, 0);
-  const pad = Math.max(0, Number(padding) || 0);
-  const availableW = Math.max(40, (Number(viewportWidth) || 1) - pad * 2);
-  const availableH = Math.max(40, (Number(viewportHeight) || 1) - pad * 2);
-
-  const scaleX = (availableW * fit.fitWidth) / (sw * frame.width);
-  const scaleY = (availableH * fit.fitWidth) / (sh * frame.width);
-  return clampZoom(Math.min(scaleX, scaleY));
+export function fitZoom(sourceWidth, sourceHeight, outputWidth, outputHeight) {
+  return fitScale(sourceWidth, sourceHeight, outputWidth, outputHeight);
 }
 
 /**

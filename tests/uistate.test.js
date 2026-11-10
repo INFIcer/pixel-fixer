@@ -206,18 +206,19 @@ test('rangeProgress 映射到 0~100 并截断', () => {
 
 /* ---------- 缩放数学 ---------- */
 
-test('缩放 clamp：夹在 10%~1600%，非法值回退 100%', () => {
-  assert.equal(clampZoom(0), 0.1);
-  assert.equal(clampZoom(0.05), 0.1);
-  assert.equal(clampZoom(20), 16);
+test('缩放 clamp：夹在 1%~6400%，非法值回退 100%', () => {
+  assert.equal(clampZoom(0), 0.01);
+  assert.equal(clampZoom(0.005), 0.01);
+  assert.equal(clampZoom(20), 20);
+  assert.equal(clampZoom(100), 64);
   assert.equal(clampZoom(Number.NaN), 1);
   assert.equal(clampZoom(1.375), 1.375);
   assert.equal(zoomPercent(1), 100);
   assert.equal(zoomPercent(1.375), 137.5);
-  assert.equal(zoomPercent(99), 1600);
+  assert.equal(zoomPercent(99), 6400);
   assert.equal(zoomFromPercent(137), 1.37);
-  assert.equal(zoomFromPercent(9999), 16);
-  assert.equal(zoomFromPercent(0), 0.1);
+  assert.equal(zoomFromPercent(9999), 64);
+  assert.equal(zoomFromPercent(0), 0.01);
   assert.equal(zoomFromPercent(Number.NaN), 1);
 });
 
@@ -226,28 +227,31 @@ test('百分比展示与输入解析：允许 %、空格、小数与越界夹取
   assert.equal(formatZoomPercent(1.37), '137%');
   assert.equal(formatZoomPercent(0.105), '10.5%');
   assert.equal(formatZoomPercent(0.1), '10%');
+  assert.equal(formatZoomPercent(0.0625), '6.25%');
+  assert.equal(formatZoomPercent(0.01), '1%');
   assert.equal(parseZoomInput('137%', 1), 1.37);
   assert.equal(parseZoomInput(' 137.5 % ', 1), 1.375);
   assert.equal(parseZoomInput('137,5', 1), 1.375);
-  assert.equal(parseZoomInput('9999', 1), 16);
-  assert.equal(parseZoomInput('-20', 1), 0.1);
+  assert.equal(parseZoomInput('9999', 1), 64);
+  assert.equal(parseZoomInput('-20', 1), 0.01);
+  assert.equal(parseZoomInput('6.25%', 1), 0.0625);
   assert.equal(parseZoomInput('abc', 1.5), 1.5);
   assert.equal(parseZoomInput('', 1.5), 1.5);
 });
 
 test('对数滑块：位置与百分比可逆且单调', () => {
-  assert.equal(percentToSlider(10), 0);
-  assert.equal(percentToSlider(1600), 1000);
-  const expected = (1000 * Math.log(10)) / Math.log(160);
+  assert.equal(percentToSlider(1), 0);
+  assert.equal(percentToSlider(6400), 1000);
+  const expected = (1000 * Math.log(100)) / Math.log(6400);
   assert.ok(Math.abs(percentToSlider(100) - expected) < 1e-9);
   assert.ok(Math.abs(sliderToPercent(percentToSlider(137)) - 137) < 1e-9);
   assert.ok(Math.abs(sliderToZoom(zoomToSlider(2.5)) - 2.5) < 1e-9);
   assert.ok(percentToSlider(100) > percentToSlider(50));
   assert.ok(percentToSlider(50) > percentToSlider(10));
-  assert.equal(sliderToPercent(-5), 10);
-  assert.equal(sliderToPercent(5000), 1600);
-  // 对数刻度中点约为几何平均 sqrt(10*1600) ≈ 126.5%。
-  assert.ok(Math.abs(sliderToPercent(500) - 10 * Math.sqrt(160)) < 1e-9);
+  assert.equal(sliderToPercent(-5), 1);
+  assert.equal(sliderToPercent(5000), 6400);
+  // 对数刻度中点约为几何平均 sqrt(1×6400) = 80%。
+  assert.ok(Math.abs(sliderToPercent(500) - 80) < 1e-9);
 });
 
 test('滚轮缩放因子：指数曲线、方向与 Shift 精调（×0.25）', () => {
@@ -267,8 +271,8 @@ test('+/- 微调：普通 1.02，Shift 1.005，边界不再越界', () => {
   assert.ok(Math.abs(stepZoom(1, -1) - 1 / 1.02) < 1e-12);
   assert.ok(Math.abs(stepZoom(1, 1, true) - 1.005) < 1e-12);
   assert.ok(Math.abs(stepZoom(1, -1, true) - 1 / 1.005) < 1e-12);
-  assert.equal(stepZoom(16, 1), 16);
-  assert.equal(stepZoom(0.1, -1), 0.1);
+  assert.equal(stepZoom(64, 1), 64);
+  assert.equal(stepZoom(0.01, -1), 0.01);
   assert.equal(zoomStepFactor(false), 1.02);
   assert.equal(zoomStepFactor(true), 1.005);
 });
@@ -354,13 +358,16 @@ test('裁切框几何与适应窗口', () => {
   assert.ok(frame.width <= 744 + 1e-9);
   assert.ok(frame.height <= 544 + 1e-9);
 
-  const scale = fitZoom(1024, 512, 64, 64, 800, 600);
-  assert.ok(scale > 0.6 && scale < 0.7);
+  const scale = fitZoom(1024, 512, 64, 64);
+  assert.equal(scale, 0.0625);
   const squareFrame = computeFrame(800, 600, 1);
   const crop = computeCropRect(1024, 512, 64, 64, scale, 0, 0);
+  assert.equal(crop.width, 1024);
+  assert.equal(crop.height, 1024);
   const viewScale = squareFrame.width / crop.width;
   assert.ok(1024 * viewScale <= 744 + 1e-9);
   assert.ok(512 * viewScale <= 544 + 1e-9);
-  assert.ok(Math.abs(fitZoom(512, 512, 64, 64, 800, 600) - 1) < 1e-9);
-  assert.equal(fitZoom(0, 100, 64, 64, 800, 600), 1);
+  // 方形 512 源图、64 输出：1/8 = 12.5%。
+  assert.ok(Math.abs(fitZoom(512, 512, 64, 64) - 0.125) < 1e-9);
+  assert.equal(fitZoom(0, 100, 64, 64), 1);
 });
