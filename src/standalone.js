@@ -510,12 +510,15 @@
     "use strict";
     // 色阶简化 / 颜色量化。
     //
-    // 阈值模式：把颜色看作 CIELAB 空间中的点，用大小随阈值变化的网格 + 并查集
-    // 求“距离小于阈值”图的连通分量（单链接层次聚类）。网格单元的对角线严格小于
-    // 阈值，因此同格颜色必然合并；只需检查相邻 ±2 格即可保证不漏边。这样比
-    // O(n²) 的完整 MST 快得多，同时颜色数量随阈值单调不增。
+    // 阈值模式：把颜色看作 CIELAB 空间中的点，建立一棵与阈值无关的固定划分树，
+    // 再按“簇内任意两色的 ΔE 不超过阈值”自上而下切割。小簇精确检查最大两两
+    // 距离，大簇用 2 × 簇心到最远成员距离作上界，因此不会出现 A~B、B~C 就把
+    // A、C 链式并在一起的单链接问题。树只由颜色数据决定，所以颜色数随阈值单调不增。
     //
     // 目标色数模式：带权 k-means++（LAB 空间），固定随机种子，结果可重现。
+    //
+    // 区域联动：聚类完成后，把“局部孤立、且与邻域主色簇心距离很近”的零散像素
+    // 并入邻域主色簇，让像素画里成片的同色更完整；固定扫描顺序，结果确定。
     //
     // 抖动：可选的 Floyd–Steinberg 误差扩散（RGB 空间，默认关闭）。
 
@@ -523,39 +526,21 @@
 
     const TRANSPARENT_INDEX = 0xffffffff;
 
-    // 精确颜色超过该数量时，阈值/目标色数模式改用 4bit/通道的预聚合模型。
-    // 64×64 输出最多只有 4096 种颜色，因此正常像素画工作流不会触发。
+    // 精确颜色超过该数量时，阈值/目标色数模式改用 5bit/通道的预聚合模型。
+    // 阈值 ≤ 2 时为了保证“只合并极少数近似色”，仍然使用精确颜色。
     const MAX_EXACT_COLORS = 7000;
 
-    const BIN_COUNT = 16 * 16 * 16;
+    /** 低于等于该阈值时不启用预聚合，避免把阈值 1 的少量近似色提前粗暴合并。 */
+    const PRECISE_THRESHOLD_LIMIT = 2;
 
-    class UnionFind {
-      constructor(size) {
-        this.parent = new Int32Array(size);
-        this.rank = new Uint8Array(size);
-        for (let i = 0; i < size; i += 1) this.parent[i] = i;
-      }
+    // 5bit/通道：32×32×32 = 32768 个格子，比 4bit 精细 8 倍。
+    const BIN_BITS = 5;
+    const BIN_SHIFT = 8 - BIN_BITS;
+    const BIN_LEVELS = 1 << BIN_BITS;
+    const BIN_COUNT = BIN_LEVELS * BIN_LEVELS * BIN_LEVELS;
 
-      find(value) {
-        let root = value;
-        while (this.parent[root] !== root) root = this.parent[root];
-        while (this.parent[value] !== value) {
-          const next = this.parent[value];
-          this.parent[value] = root;
-          value = next;
-        }
-        return root;
-      }
-
-      union(a, b) {
-        let rootA = this.find(a);
-        let rootB = this.find(b);
-        if (rootA === rootB) return false;
-        if (this.rank[rootA] < this.rank[rootB]) [rootA, rootB] = [rootB, rootA];
-        this.parent[rootB] = rootA;
-        if (this.rank[rootA] === this.rank[rootB]) this.rank[rootA] += 1;
-        return true;
-      }
+    function binKey(r, g, b) {
+      return ((r >> BIN_SHIFT) << (BIN_BITS * 2)) | ((g >> BIN_SHIFT) << BIN_BITS) | (b >> BIN_SHIFT);
     }
 
     function validateImage(image) {
@@ -613,7 +598,7 @@
           const offset = i * 4;
           if (data[offset + 3] === 0) continue;
           opaquePixels += 1;
-          const key = ((data[offset] >> 4) << 8) | ((data[offset + 1] >> 4) << 4) | (data[offset + 2] >> 4);
+          const key = binKey(data[offset], data[offset + 1], data[offset + 2]);
           counts[key] += 1;
           sumR[key] += data[offset];
           sumG[key] += data[offset + 1];
@@ -624,6 +609,7 @@
         for (let key = 0; key < BIN_COUNT; key += 1) {
           if (!counts[key]) continue;
           const count = counts[key];
+          // 每个候选色的真实位置仍然是该格内所有真实像素的均值。
           const r = Math.round(sumR[key] / count);
           const g = Math.round(sumG[key] / count);
           const b = Math.round(sumB[key] / count);
@@ -666,6 +652,255 @@
       return { r, g, b, hex: rgbToHex(r, g, b), count };
     }
 
+    // 半径受限的层次划分：
+    // - 划分树只由颜色数据决定、与阈值无关，因此阈值越高只会把节点从“继续分”
+    //   改为“合并”，颜色数必然单调不增；
+    // - 每个节点记录簇内任意两色的最大距离（小簇精确计算，大簇用 2 × 半径作
+    //   上界），只有该距离 ≤ 阈值时才允许整块保留，所以不会出现 A~B、B~C 就把
+    //   A、C 链式并进来的情况；
+    // - 划分时优先在颜色分布的空隙处切开，避免把同一团相近色拆到两个分支里。
+    const EXACT_DIAMETER_LIMIT = 64;
+    const MAX_HIERARCHY_DEPTH = 128;
+    // 同一份颜色模型在阈值滑动时复用这棵树，避免重复计算。
+    const hierarchyCache = new WeakMap();
+
+    /** 计算区间内颜色在 LAB 各轴上的跨度，返回跨度最大的轴与跨度。 */
+    function widestRange(order, start, end, labs) {
+      let minL = Number.POSITIVE_INFINITY;
+      let maxL = Number.NEGATIVE_INFINITY;
+      let minA = Number.POSITIVE_INFINITY;
+      let maxA = Number.NEGATIVE_INFINITY;
+      let minB = Number.POSITIVE_INFINITY;
+      let maxB = Number.NEGATIVE_INFINITY;
+      for (let i = start; i < end; i += 1) {
+        const offset = order[i] * 3;
+        const l = labs[offset];
+        const a = labs[offset + 1];
+        const b = labs[offset + 2];
+        if (l < minL) minL = l;
+        if (l > maxL) maxL = l;
+        if (a < minA) minA = a;
+        if (a > maxA) maxA = a;
+        if (b < minB) minB = b;
+        if (b > maxB) maxB = b;
+      }
+      const ranges = [maxL - minL, maxA - minA, maxB - minB];
+      let dimension = 0;
+      if (ranges[1] > ranges[dimension]) dimension = 1;
+      if (ranges[2] > ranges[dimension]) dimension = 2;
+      return { dimension, range: ranges[dimension] };
+    }
+
+    /**
+     * 在区间内选择切分点。
+     * 优先选两侧成员都不太少的最大空隙；若某个空隙特别大（≥ 全跨度的 1/4），
+     * 即使一侧成员很少也允许切开，这样远离主色的少量颜色不会把整团相近色拆散。
+     * 深度过大时退回中位切分，保证树深有上界。
+     */
+    function chooseSplit(order, start, end, labs, depth) {
+      if (end - start <= 1) return -1;
+      const { dimension, range } = widestRange(order, start, end, labs);
+      if (!(range > 1e-9)) return -1;
+
+      const view = order.subarray(start, end);
+      view.sort((left, right) => {
+        const delta = labs[left * 3 + dimension] - labs[right * 3 + dimension];
+        return delta !== 0 ? delta : left - right;
+      });
+
+      const length = end - start;
+      if (depth >= MAX_HIERARCHY_DEPTH) return start + (length >> 1);
+
+      const minSide = length <= 24 ? 1 : Math.max(1, Math.floor(length * 0.05));
+      const hugeGap = range * 0.25;
+      let bestPosition = -1;
+      let bestGap = -1;
+      for (let i = 1; i < length; i += 1) {
+        const gap = labs[order[start + i] * 3 + dimension] - labs[order[start + i - 1] * 3 + dimension];
+        const side = Math.min(i, length - i);
+        if (side < minSide && gap < hugeGap) continue;
+        if (gap > bestGap + 1e-12) {
+          bestGap = gap;
+          bestPosition = i;
+        } else if (Math.abs(gap - bestGap) <= 1e-12) {
+          // 空隙相同时取更靠近中间的位置，避免树退化成一条链。
+          const previous = Math.abs(bestPosition - length / 2);
+          const current = Math.abs(i - length / 2);
+          if (current < previous) bestPosition = i;
+        }
+      }
+      if (bestPosition <= 0) bestPosition = length >> 1;
+      return start + bestPosition;
+    }
+
+    /**
+     * 建立与阈值无关的颜色划分树。节点成员用 order[start, end) 表示；
+     * 区间在构造过程中被重排成连续块，因此不需要为每个节点保存成员数组。
+     */
+    function buildColorHierarchy(model) {
+      const { entries, labs } = model;
+      const n = entries.length;
+      if (n === 0) return null;
+
+      const order = new Uint32Array(n);
+      for (let i = 0; i < n; i += 1) order[i] = i;
+
+      const capacity = Math.max(1, n * 2 - 1);
+      const starts = new Uint32Array(capacity);
+      const ends = new Uint32Array(capacity);
+      const centers = new Float64Array(capacity * 3);
+      const weights = new Float64Array(capacity);
+      // 簇内最大两两距离的平方（小簇精确值，大簇用上界）。
+      const extents = new Float64Array(capacity);
+      const lefts = new Int32Array(capacity).fill(-1);
+      const rights = new Int32Array(capacity).fill(-1);
+      const depths = new Uint16Array(capacity);
+      let nodeCount = 0;
+
+      function createNode(start, end, depth) {
+        let weight = 0;
+        let sumL = 0;
+        let sumA = 0;
+        let sumB = 0;
+        for (let i = start; i < end; i += 1) {
+          const index = order[i];
+          const count = entries[index].count;
+          const offset = index * 3;
+          weight += count;
+          sumL += labs[offset] * count;
+          sumA += labs[offset + 1] * count;
+          sumB += labs[offset + 2] * count;
+        }
+        const centerL = sumL / weight;
+        const centerA = sumA / weight;
+        const centerB = sumB / weight;
+
+        // 先算 2 × 最大半径作为平方上界；成员较少时再算精确的最大两两距离，
+        // 避免“近似圆”被上界误判为超过阈值而多切一刀。
+        let maxRadiusSq = 0;
+        for (let i = start; i < end; i += 1) {
+          const offset = order[i] * 3;
+          const dl = labs[offset] - centerL;
+          const da = labs[offset + 1] - centerA;
+          const db = labs[offset + 2] - centerB;
+          const distanceSq = dl * dl + da * da + db * db;
+          if (distanceSq > maxRadiusSq) maxRadiusSq = distanceSq;
+        }
+        let extent = 4 * maxRadiusSq;
+
+        const length = end - start;
+        if (length > 1 && length <= EXACT_DIAMETER_LIMIT) {
+          let exact = 0;
+          for (let i = start; i < end; i += 1) {
+            const leftOffset = order[i] * 3;
+            const ll = labs[leftOffset];
+            const la = labs[leftOffset + 1];
+            const lb = labs[leftOffset + 2];
+            for (let j = i + 1; j < end; j += 1) {
+              const rightOffset = order[j] * 3;
+              const dl = ll - labs[rightOffset];
+              const da = la - labs[rightOffset + 1];
+              const db = lb - labs[rightOffset + 2];
+              const distanceSq = dl * dl + da * da + db * db;
+              if (distanceSq > exact) exact = distanceSq;
+            }
+          }
+          if (exact < extent) extent = exact;
+        }
+
+        const id = nodeCount;
+        nodeCount += 1;
+        starts[id] = start;
+        ends[id] = end;
+        centers[id * 3] = centerL;
+        centers[id * 3 + 1] = centerA;
+        centers[id * 3 + 2] = centerB;
+        weights[id] = weight;
+        extents[id] = extent;
+        depths[id] = depth;
+        return id;
+      }
+
+      const root = createNode(0, n, 0);
+      const stack = [root];
+      while (stack.length) {
+        const node = stack.pop();
+        const start = starts[node];
+        const end = ends[node];
+        if (end - start <= 1 || extents[node] <= 1e-12) continue;
+        const middle = chooseSplit(order, start, end, labs, depths[node]);
+        if (middle <= start || middle >= end) continue;
+        const left = createNode(start, middle, depths[node] + 1);
+        const right = createNode(middle, end, depths[node] + 1);
+        lefts[node] = left;
+        rights[node] = right;
+        stack.push(left, right);
+      }
+
+      return { order, starts, ends, centers, weights, extents, lefts, rights };
+    }
+
+    function hierarchyFor(model) {
+      let hierarchy = hierarchyCache.get(model);
+      if (!hierarchy) {
+        hierarchy = buildColorHierarchy(model);
+        if (hierarchy) hierarchyCache.set(model, hierarchy);
+      }
+      return hierarchy;
+    }
+
+    /** 按阈值自上而下切树：节点内最大色差 ≤ 阈值就整块保留，否则继续分。 */
+    function collectThresholdClusters(model, threshold) {
+      const hierarchy = hierarchyFor(model);
+      if (!hierarchy) return [];
+      const limitSq = threshold * threshold + 1e-9;
+      const output = [];
+      const stack = [0];
+      while (stack.length) {
+        const node = stack.pop();
+        if (hierarchy.extents[node] <= limitSq || hierarchy.lefts[node] === -1) {
+          output.push(node);
+          continue;
+        }
+        stack.push(hierarchy.rights[node], hierarchy.lefts[node]);
+      }
+      return output;
+    }
+
+    function clustersToPalette(model, hierarchy, clusterNodes) {
+      const n = model.entries.length;
+      const uniqueToPalette = new Uint32Array(n);
+      const palette = [];
+      const ordered = clusterNodes.slice().sort((left, right) => (
+        hierarchy.weights[right] - hierarchy.weights[left]
+        || hierarchy.centers[left * 3] - hierarchy.centers[right * 3]
+      ));
+
+      ordered.forEach((node, paletteIndex) => {
+        const start = hierarchy.starts[node];
+        const end = hierarchy.ends[node];
+        let r;
+        let g;
+        let b;
+        if (end - start === 1) {
+          const only = model.entries[hierarchy.order[start]];
+          r = only.r;
+          g = only.g;
+          b = only.b;
+        } else {
+          [r, g, b] = labToRgb(
+            hierarchy.centers[node * 3],
+            hierarchy.centers[node * 3 + 1],
+            hierarchy.centers[node * 3 + 2],
+          );
+        }
+        palette.push(paletteEntryFromColor(r, g, b, hierarchy.weights[node]));
+        for (let i = start; i < end; i += 1) uniqueToPalette[hierarchy.order[i]] = paletteIndex;
+      });
+
+      return { palette, uniqueToPalette };
+    }
+
     function thresholdClusters(model, threshold) {
       const n = model.entries.length;
       const uniqueToPalette = new Uint32Array(n);
@@ -679,123 +914,9 @@
         return { palette, uniqueToPalette };
       }
 
-      const labs = model.labs;
-      const uf = new UnionFind(n);
-
-      // 单元对角线严格小于阈值，保证同格颜色两两距离 < 阈值。
-      const cellSize = threshold / (Math.sqrt(3) * 1.000001);
-      const cells = new Map();
-      for (let i = 0; i < n; i += 1) {
-        const cx = Math.floor(labs[i * 3] / cellSize);
-        const cy = Math.floor(labs[i * 3 + 1] / cellSize);
-        const cz = Math.floor(labs[i * 3 + 2] / cellSize);
-        const key = `${cx},${cy},${cz}`;
-        let cell = cells.get(key);
-        if (!cell) {
-          cell = { cx, cy, cz, members: [] };
-          cells.set(key, cell);
-        }
-        cell.members.push(i);
-      }
-
-      // 同格颜色必然在同一连通分量。
-      for (const cell of cells.values()) {
-        if (cell.members.length < 2) continue;
-        const first = cell.members[0];
-        for (let m = 1; m < cell.members.length; m += 1) {
-          uf.union(first, cell.members[m]);
-        }
-      }
-
-      // 只需检查正方向的 ±2 格邻域；每个无序格对只检查一次。
-      const offsets = [];
-      for (let dx = -2; dx <= 2; dx += 1) {
-        for (let dy = -2; dy <= 2; dy += 1) {
-          for (let dz = -2; dz <= 2; dz += 1) {
-            if (dx === 0 && dy === 0 && dz === 0) continue;
-            if (dx > 0 || (dx === 0 && dy > 0) || (dx === 0 && dy === 0 && dz > 0)) {
-              offsets.push([dx, dy, dz]);
-            }
-          }
-        }
-      }
-
-      const limit = threshold * threshold;
-      for (const cell of cells.values()) {
-        for (const [dx, dy, dz] of offsets) {
-          const other = cells.get(`${cell.cx + dx},${cell.cy + dy},${cell.cz + dz}`);
-          if (!other) continue;
-          if (uf.find(other.members[0]) === uf.find(cell.members[0])) continue;
-
-          let merged = false;
-          for (const a of cell.members) {
-            const a3 = a * 3;
-            const al = labs[a3];
-            const aa = labs[a3 + 1];
-            const ab = labs[a3 + 2];
-            for (const b of other.members) {
-              const b3 = b * 3;
-              const dl = al - labs[b3];
-              const da = aa - labs[b3 + 1];
-              const db = ab - labs[b3 + 2];
-              if (dl * dl + da * da + db * db < limit) {
-                uf.union(a, b);
-                merged = true;
-                break;
-              }
-            }
-            if (merged) break;
-          }
-        }
-      }
-
-      const groups = new Map();
-      for (let i = 0; i < n; i += 1) {
-        const root = uf.find(i);
-        let members = groups.get(root);
-        if (!members) {
-          members = [];
-          groups.set(root, members);
-        }
-        members.push(i);
-      }
-
-      const clusters = [];
-      for (const members of groups.values()) {
-        let count = 0;
-        let sumL = 0;
-        let sumA = 0;
-        let sumB = 0;
-        for (const index of members) {
-          const entry = model.entries[index];
-          const countWeight = entry.count;
-          count += countWeight;
-          sumL += model.labs[index * 3] * countWeight;
-          sumA += model.labs[index * 3 + 1] * countWeight;
-          sumB += model.labs[index * 3 + 2] * countWeight;
-        }
-
-        let r;
-        let g;
-        let b;
-        if (members.length === 1) {
-          const only = model.entries[members[0]];
-          r = only.r;
-          g = only.g;
-          b = only.b;
-        } else {
-          [r, g, b] = labToRgb(sumL / count, sumA / count, sumB / count);
-        }
-        clusters.push({ color: paletteEntryFromColor(r, g, b, count), members, count });
-      }
-
-      clusters.sort((a, b) => b.count - a.count || a.color.hex.localeCompare(b.color.hex));
-      const palette = clusters.map((cluster, paletteIndex) => {
-        for (const member of cluster.members) uniqueToPalette[member] = paletteIndex;
-        return cluster.color;
-      });
-
-      return { palette, uniqueToPalette };
+      const hierarchy = hierarchyFor(model);
+      const clusters = collectThresholdClusters(model, threshold);
+      return clustersToPalette(model, hierarchy, clusters);
     }
 
     function mulberry32(seed) {
@@ -1046,7 +1167,7 @@
         for (let i = 0; i < width * height; i += 1) {
           const offset = i * 4;
           if (data[offset + 3] === 0) continue;
-          const key = ((data[offset] >> 4) << 8) | ((data[offset + 1] >> 4) << 4) | (data[offset + 2] >> 4);
+          const key = binKey(data[offset], data[offset + 1], data[offset + 2]);
           const entryIndex = binLookup[key];
           if (entryIndex >= 0) indices[i] = uniqueToPalette[entryIndex];
         }
@@ -1062,6 +1183,110 @@
         if (entryIndex !== undefined) indices[i] = uniqueToPalette[entryIndex];
       }
       return indices;
+    }
+
+    // 区域联动时允许并入邻域主色的最大色差。ΔE 3 约为人眼可察觉的差异下限，
+    // 超过它就可能把用户有意保留的两种颜色抹成一种，因此即使阈值很高也到此为止。
+    const SPATIAL_MAX_DELTA = 3;
+
+    /**
+     * 区域联动：把局部孤立的零散像素并入邻域主色簇。
+     *
+     * 规则（全部确定性）：
+     * - 按行优先固定顺序扫描，每轮基于上一轮快照判断，最多 2 轮；
+     * - 只处理 8 邻域里没有任何同簇像素的孤立像素；
+     * - 邻域主色簇需占可见邻域的 60% 以上（角落至少 3 个邻居）；
+     * - 当前簇与邻域主色簇的簇心色差需不超过 min(阈值, 3)；
+     * - 棋盘格像素在斜向有同簇邻居，不会被改动；成片区域内部也不会被改动。
+     *
+     * @param {{data:Uint8ClampedArray|Uint8Array,width:number,height:number}} image
+     * @param {Uint32Array} indices 聚类后的调色板索引
+     * @param {Array<{r:number,g:number,b:number}>} palette 调色板
+     * @param {number} threshold 阈值（ΔE）；≤0 时不生效
+     * @param {number} [rounds=2] 平滑轮数（1~2）
+     * @returns {{indices:Uint32Array, moved:number}}
+     */
+    function smoothSpatialIndices(image, indices, palette, threshold, rounds = 2) {
+      const result = new Uint32Array(indices);
+      if (!(threshold > 0) || !palette || palette.length < 2) {
+        return { indices: result, moved: 0 };
+      }
+
+      const { width, height, data } = image;
+      const labs = new Float64Array(palette.length * 3);
+      for (let i = 0; i < palette.length; i += 1) {
+        const lab = rgbToLab(palette[i].r, palette[i].g, palette[i].b);
+        labs[i * 3] = lab[0];
+        labs[i * 3 + 1] = lab[1];
+        labs[i * 3 + 2] = lab[2];
+      }
+
+      const limitSq = Math.min(threshold, SPATIAL_MAX_DELTA) ** 2;
+      const neighborOffsets = [
+        [-1, -1], [0, -1], [1, -1],
+        [-1, 0], [1, 0],
+        [-1, 1], [0, 1], [1, 1],
+      ];
+      const counts = new Uint32Array(palette.length);
+      const touched = [];
+      let movedTotal = 0;
+
+      const roundCount = Math.max(1, Math.min(2, Math.round(rounds)));
+      for (let round = 0; round < roundCount; round += 1) {
+        const snapshot = result.slice();
+        let moved = 0;
+        for (let y = 0; y < height; y += 1) {
+          for (let x = 0; x < width; x += 1) {
+            const pixel = y * width + x;
+            if (data[pixel * 4 + 3] === 0) continue;
+            const self = snapshot[pixel];
+            if (self === TRANSPARENT_INDEX) continue;
+
+            let sameNeighbors = 0;
+            let visibleNeighbors = 0;
+            let bestIndex = -1;
+            let bestCount = 0;
+            touched.length = 0;
+            for (const [dx, dy] of neighborOffsets) {
+              const nx = x + dx;
+              const ny = y + dy;
+              if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+              const neighbor = ny * width + nx;
+              if (data[neighbor * 4 + 3] === 0) continue;
+              visibleNeighbors += 1;
+              const index = snapshot[neighbor];
+              if (index === TRANSPARENT_INDEX) continue;
+              if (index === self) {
+                sameNeighbors += 1;
+                continue;
+              }
+              if (counts[index] === 0) touched.push(index);
+              counts[index] += 1;
+              if (counts[index] > bestCount
+                || (counts[index] === bestCount && (bestIndex < 0 || index < bestIndex))) {
+                bestCount = counts[index];
+                bestIndex = index;
+              }
+            }
+            for (const index of touched) counts[index] = 0;
+
+            if (sameNeighbors > 0 || bestIndex < 0) continue;
+            const required = Math.max(3, Math.ceil(visibleNeighbors * 0.6));
+            if (bestCount < required) continue;
+            const self3 = self * 3;
+            const best3 = bestIndex * 3;
+            const dl = labs[self3] - labs[best3];
+            const da = labs[self3 + 1] - labs[best3 + 1];
+            const db = labs[self3 + 2] - labs[best3 + 2];
+            if (dl * dl + da * da + db * db > limitSq + 1e-9) continue;
+            result[pixel] = bestIndex;
+            moved += 1;
+          }
+        }
+        movedTotal += moved;
+        if (moved === 0) break;
+      }
+      return { indices: result, moved: movedTotal };
     }
 
     /** 计算实际使用到的调色板颜色并删除零占比颜色，同时重映射索引。 */
@@ -1115,6 +1340,7 @@
      *   threshold?: number,
      *   maxColors?: number,
      *   dither?: boolean,
+     *   spatial?: boolean,
      *   model?: object
      * }} options
      */
@@ -1124,12 +1350,15 @@
       const threshold = clamp(Number(options.threshold) || 0, 0, 100);
       const maxColors = Math.max(1, Math.min(256, Math.round(Number(options.maxColors) || 16)));
       const dither = Boolean(options.dither);
+      const spatial = Boolean(options.spatial);
 
       let model = modelMatches(image, options.model) ? options.model : createColorModel(image);
       let approximate = false;
       const needsClustering = mode === 'target' || threshold > 0;
+      // 阈值 ≤ 2 时即使颜色很多也不用预聚合，保证“阈值 1 只合并极少数近似色”。
+      const allowPreaggregate = mode === 'target' || threshold > PRECISE_THRESHOLD_LIMIT;
 
-      if (needsClustering && model.entries.length > MAX_EXACT_COLORS && model.kind === 'exact') {
+      if (needsClustering && allowPreaggregate && model.entries.length > MAX_EXACT_COLORS && model.kind === 'exact') {
         if (!model.binnedFallback) {
           model.binnedFallback = createColorModel(image, { binned: true });
         }
@@ -1142,6 +1371,15 @@
         : thresholdClusters(model, threshold);
 
       let indices = buildIndices(image, model, clusters.uniqueToPalette);
+      let spatialApplied = false;
+      let spatialMoved = 0;
+      // 抖动会把像素刻意打散，与区域联动的目标冲突，因此抖动开启时不参与。
+      if (spatial && !dither && mode === 'threshold' && threshold > 0) {
+        const smoothed = smoothSpatialIndices(image, indices, clusters.palette, threshold);
+        indices = smoothed.indices;
+        spatialMoved = smoothed.moved;
+        spatialApplied = true;
+      }
       if (dither) {
         indices = ditherIndices(image, clusters.palette);
       }
@@ -1154,6 +1392,8 @@
         threshold,
         maxColors,
         dither,
+        spatial: spatialApplied,
+        spatialMoved,
         palette,
         indices,
         colorCount: palette.length,
@@ -1164,7 +1404,7 @@
       };
     }
 
-    Object.assign(__exports, { TRANSPARENT_INDEX, MAX_EXACT_COLORS, createColorModel, quantize });
+    Object.assign(__exports, { TRANSPARENT_INDEX, MAX_EXACT_COLORS, PRECISE_THRESHOLD_LIMIT, createColorModel, smoothSpatialIndices, quantize });
   });
 
   __define("exporter", function (__exports, __require) {
@@ -1517,7 +1757,7 @@
       const fallbackPercent = (Number(fallbackScale) || 1) * 100;
       const number = Number(value);
       const percent = Number.isFinite(number) ? number : fallbackPercent;
-      return Math.round(Math.max(10, Math.min(1600, percent)) * 100) / 100;
+      return Math.round(Math.max(1, Math.min(6400, percent)) * 100) / 100;
     }
 
     function normalizeUi(value, fallbackScale = 1) {
@@ -1556,7 +1796,10 @@
 
       const transformRaw = raw.transform && typeof raw.transform === 'object' ? raw.transform : {};
       const transform = {
-        scale: finiteNumber(transformRaw.scale, 1, 0.1, 16),
+        // 新语义：scale=1 表示像素 1:1，范围 1%~6400%。
+        // 旧工程没有 scaleMode，按 fit（相对适应框的倍数）识别，加载时自动换算。
+        scale: finiteNumber(transformRaw.scale, 1, 0.01, 64),
+        scaleMode: transformRaw.scaleMode === 'pixel' ? 'pixel' : 'fit',
         offsetX: finiteNumber(transformRaw.offsetX, 0, -100000, 100000),
         offsetY: finiteNumber(transformRaw.offsetY, 0, -100000, 100000),
         outputWidth: integer(transformRaw.outputWidth, 64, 8, 512),
@@ -1584,6 +1827,8 @@
         threshold: finiteNumber(raw.threshold, 0, 0, 100),
         maxColors: integer(raw.maxColors, 16, 1, 256),
         dither: Boolean(raw.dither),
+        // 区域联动：只有明确写入 false 才关闭；旧工程缺省视为开启。
+        colorSpatial: raw.colorSpatial !== false,
         palette: normalizePalette(raw.palette),
         recolorMap: normalizeRecolorMap(raw.recolorMap),
         manualPalette: normalizePalette(raw.manualPalette),
@@ -1607,12 +1852,14 @@
         sourceWidth: input?.sourceWidth,
         sourceHeight: input?.sourceHeight,
         sourceName: input?.sourceName,
-        transform: input?.transform,
+        // 新保存的工程固定写 pixel 口径；旧工程没有该字段时按 fit 处理。
+        transform: { ...(input?.transform || {}), scaleMode: 'pixel' },
         resample: input?.resample,
         colorMode: input?.colorMode,
         threshold: input?.threshold,
         maxColors: input?.maxColors,
         dither: input?.dither,
+        colorSpatial: input?.colorSpatial,
         palette: input?.palette,
         recolorMap: input?.recolorMap,
         manualPalette: input?.manualPalette,
@@ -1655,8 +1902,8 @@
     const { resample } = __require("resample");
     const { TRANSPARENT_INDEX } = __require("quantize");
 
-    const MIN_SCALE = 0.1;
-    const MAX_SCALE = 16;
+    const MIN_SCALE = 0.01;
+    const MAX_SCALE = 64;
 
     function clampScale(scale) {
       const value = Number(scale);
@@ -1672,26 +1919,17 @@
 
     /**
      * 计算裁剪区域（源图像素坐标）。
-     * scale=1 时，裁剪框是源图内能放下的最大输出宽高比区域；
-     * scale 越大裁剪越小（放大），offsetX/offsetY 是裁剪中心相对源图中心的偏移。
+     * 新语义：100%（scale=1）= 像素 1:1，即裁切框在源图上正好取输出尺寸那么大。
+     *   cropWidth = outputWidth / scale，cropHeight = outputHeight / scale
+     * scale>1 放大（裁切更小），scale<1 缩小（裁切更大）。
+     * offsetX/offsetY 是裁剪中心相对源图中心的偏移（源图像素）。
      */
     function computeCropRect(sourceWidth, sourceHeight, outputWidth, outputHeight, scale = 1, offsetX = 0, offsetY = 0) {
       if (!(sourceWidth > 0) || !(sourceHeight > 0)) throw new TypeError('源图尺寸无效');
       if (!(outputWidth > 0) || !(outputHeight > 0)) throw new TypeError('输出尺寸无效');
-      const aspect = outputWidth / outputHeight;
-      let fitWidth;
-      let fitHeight;
-      if (sourceWidth / sourceHeight > aspect) {
-        fitHeight = sourceHeight;
-        fitWidth = sourceHeight * aspect;
-      } else {
-        fitWidth = sourceWidth;
-        fitHeight = sourceWidth / aspect;
-      }
-
       const safeScale = clampScale(scale);
-      const cropWidth = fitWidth / safeScale;
-      const cropHeight = fitHeight / safeScale;
+      const cropWidth = outputWidth / safeScale;
+      const cropHeight = outputHeight / safeScale;
       const centerX = sourceWidth / 2 + (Number(offsetX) || 0);
       const centerY = sourceHeight / 2 + (Number(offsetY) || 0);
 
@@ -1700,9 +1938,34 @@
         y: centerY - cropHeight / 2,
         width: cropWidth,
         height: cropHeight,
-        fitWidth,
-        fitHeight,
       };
+    }
+
+    /** 让整张源图落入裁切框的缩放值：min(输出宽/源宽, 输出高/源高)。 */
+    function fitScale(sourceWidth, sourceHeight, outputWidth, outputHeight) {
+      const sw = Number(sourceWidth);
+      const sh = Number(sourceHeight);
+      const ow = Number(outputWidth);
+      const oh = Number(outputHeight);
+      if (!(sw > 0) || !(sh > 0) || !(ow > 0) || !(oh > 0)) return 1;
+      return clampScale(Math.min(ow / sw, oh / sh));
+    }
+
+    /**
+     * 旧工程的缩放语义是“相对适应框的倍数”：scale=1 时裁切框是源图内最大的
+     * 输出宽高比矩形。换算成新语义（像素 1:1）：
+     *   newScale = oldScale × 输出宽 / 旧适应框宽
+     * offset 仍是源图像素偏移，含义不变。
+     */
+    function convertLegacyScale(legacyScale, sourceWidth, sourceHeight, outputWidth, outputHeight) {
+      const sw = Number(sourceWidth);
+      const sh = Number(sourceHeight);
+      const ow = Number(outputWidth);
+      const oh = Number(outputHeight);
+      if (!(sw > 0) || !(sh > 0) || !(ow > 0) || !(oh > 0)) return 1;
+      const aspect = ow / oh;
+      const fitWidth = sw / sh > aspect ? sh * aspect : sw;
+      return clampScale((Number(legacyScale) || 1) * (ow / fitWidth));
     }
 
     /**
@@ -1727,6 +1990,8 @@
         scale: safeScale,
         offsetX: x + rect.width / 2 - sourceWidth / 2,
         offsetY: y + rect.height / 2 - sourceHeight / 2,
+        // 是否因为贴边被约束，界面用来给出“已尽量靠边”的书面提示。
+        clamped: Math.abs(x - rawX) > 1e-6 || Math.abs(y - rawY) > 1e-6,
       };
     }
 
@@ -1824,7 +2089,7 @@
         : `rgb(${entry.r} ${entry.g} ${entry.b} / ${alpha})`;
     }
 
-    Object.assign(__exports, { MIN_SCALE, MAX_SCALE, clampScale, normalizeOutputSize, computeCropRect, constrainTransform, resampleOutput, normalizeRecolorMap, resolvePalette, composeOutput, cssColor });
+    Object.assign(__exports, { MIN_SCALE, MAX_SCALE, clampScale, normalizeOutputSize, computeCropRect, fitScale, convertLegacyScale, constrainTransform, resampleOutput, normalizeRecolorMap, resolvePalette, composeOutput, cssColor });
   });
 
   __define("uistate", function (__exports, __require) {
@@ -1834,7 +2099,7 @@
 
     const { clamp } = __require("color");
     const { buildExportFilename } = __require("exporter");
-    const { computeCropRect, constrainTransform, normalizeOutputSize } = __require("engine");
+    const { clampScale, computeCropRect, constrainTransform, fitScale, normalizeOutputSize } = __require("engine");
 
     /** 最大公约数，用于化简宽高比。 */
     function gcd(a, b) {
@@ -1873,9 +2138,129 @@
       return '100%';
     }
 
+    /* ---------- 输出宽高输入（输入中不钳制，提交时才规范化） ---------- */
+
+    /** 输出尺寸的合法范围，与 engine.js 的 normalizeOutputSize 保持一致。 */
+    const CROP_SIZE_MIN = 8;
+    const CROP_SIZE_MAX = 512;
+
+    /**
+     * 解析宽/高输入框里的文本。输入过程中允许空值、暂时不合法的中间态，
+     * 这里只做“能不能读成一个数”的判断，不钳制、不回写。
+     * @returns {{valid:boolean, value:number|null, empty:boolean}}
+     */
+    function parseCropSizeInput(text) {
+      const raw = String(text ?? '')
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, '')
+        .replace(/,/g, '.')
+        .replace(/px$/, '');
+      if (!raw) return { valid: false, value: null, empty: true };
+      if (!/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(raw)) return { valid: false, value: null, empty: false };
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return { valid: false, value: null, empty: false };
+      return { valid: true, value, empty: false };
+    }
+
+    /** 把数值规范化为 8~512 的整数；非法值回退到 fallback（同样会被规范化）。 */
+    function normalizeCropSize(value, fallback = 64) {
+      const fallbackValue = Number.isFinite(Number(fallback)) ? Number(fallback) : 64;
+      return normalizeOutputSize(value, fallbackValue);
+    }
+
+    /**
+     * 提交一次宽/高编辑（失焦或回车时调用）。
+     * - 只按用户正在编辑的那一边联动，绝不改回用户刚输入的那一边；
+     * - 输入为空或不是数字时整体回退到当前值；
+     * - 合法但越界的数值夹到 8~512。
+     * @param {object} input
+     * @param {'width'|'height'} input.which 正在编辑的输入框
+     * @param {string} input.widthText 宽度输入框文本
+     * @param {string} input.heightText 高度输入框文本
+     * @param {number} input.currentWidth 当前宽度
+     * @param {number} input.currentHeight 当前高度
+     * @param {number} input.ratio 锁定时的宽高比（宽 / 高）
+     * @param {boolean} input.lockAspect 是否锁定宽高比
+     * @returns {{width:number,height:number,changed:boolean,invalid:boolean}}
+     */
+    function resolveCropSizeEdit(input = {}) {
+      const which = input.which === 'height' ? 'height' : 'width';
+      const currentWidth = normalizeCropSize(input.currentWidth, 64);
+      const currentHeight = normalizeCropSize(input.currentHeight, 64);
+      const parsedWidth = parseCropSizeInput(input.widthText ?? String(currentWidth));
+      const parsedHeight = parseCropSizeInput(input.heightText ?? String(currentHeight));
+      const edited = which === 'height' ? parsedHeight : parsedWidth;
+
+      if (!edited.valid) {
+        return {
+          width: currentWidth,
+          height: currentHeight,
+          changed: false,
+          invalid: true,
+        };
+      }
+
+      let width = currentWidth;
+      let height = currentHeight;
+      const safeRatio = Number(input.ratio);
+
+      if (which === 'width') {
+        width = normalizeCropSize(edited.value, currentWidth);
+        if (input.lockAspect && Number.isFinite(safeRatio) && safeRatio > 0) {
+          height = normalizeCropSize(width / safeRatio, currentHeight);
+        } else if (parsedHeight.valid) {
+          height = normalizeCropSize(parsedHeight.value, currentHeight);
+        }
+      } else {
+        height = normalizeCropSize(edited.value, currentHeight);
+        if (input.lockAspect && Number.isFinite(safeRatio) && safeRatio > 0) {
+          width = normalizeCropSize(height * safeRatio, currentWidth);
+        } else if (parsedWidth.valid) {
+          width = normalizeCropSize(parsedWidth.value, currentWidth);
+        }
+      }
+
+      return {
+        width,
+        height,
+        changed: width !== currentWidth || height !== currentHeight,
+        invalid: false,
+      };
+    }
+
+    /** Esc 取消：恢复进入输入框时记录的宽高。 */
+    function restoreCropSizeSnapshot(snapshot, fallbackWidth = 64, fallbackHeight = 64) {
+      return {
+        width: normalizeCropSize(snapshot?.width, fallbackWidth),
+        height: normalizeCropSize(snapshot?.height, fallbackHeight),
+      };
+    }
+
+    /**
+     * 加/减按钮（或方向键）的即时步进：基于当前已提交值计算，不读取输入框里的中间态。
+     */
+    function stepCropSize(input = {}) {
+      const which = input.which === 'height' ? 'height' : 'width';
+      const currentWidth = normalizeCropSize(input.currentWidth, 64);
+      const currentHeight = normalizeCropSize(input.currentHeight, 64);
+      const delta = Math.round(Number(input.delta) || 0);
+      const nextWidth = which === 'width' ? currentWidth + delta : currentWidth;
+      const nextHeight = which === 'height' ? currentHeight + delta : currentHeight;
+      return resolveCropSizeEdit({
+        which,
+        widthText: String(nextWidth),
+        heightText: String(nextHeight),
+        currentWidth,
+        currentHeight,
+        ratio: input.ratio,
+        lockAspect: Boolean(input.lockAspect),
+      });
+    }
+
     /**
      * 锁定宽高比时的尺寸联动。
-     * 与直接取整可能产生 1px 误差，因此再次校正一次，保证结果尽量贴近比例。
+     * 只按正在编辑的那一边推导另一边，不再反过来修正用户刚输入的值。
      * @param {'width'|'height'} which 用户正在编辑的输入框
      * @param {number} width 输入框里的宽度值
      * @param {number} height 输入框里的高度值
@@ -1885,25 +2270,29 @@
      * @returns {{width:number,height:number}}
      */
     function applyAspectLock(which, width, height, ratio, fallbackWidth = 64, fallbackHeight = 64) {
-      let nextWidth = normalizeOutputSize(width, fallbackWidth);
-      let nextHeight = normalizeOutputSize(height, fallbackHeight);
+      const parsedWidth = parseCropSizeInput(String(width));
+      const parsedHeight = parseCropSizeInput(String(height));
+      const baseWidth = parsedWidth.valid
+        ? normalizeCropSize(parsedWidth.value, fallbackWidth)
+        : normalizeCropSize(fallbackWidth, 64);
+      const baseHeight = parsedHeight.valid
+        ? normalizeCropSize(parsedHeight.value, fallbackHeight)
+        : normalizeCropSize(fallbackHeight, 64);
       const safeRatio = Number(ratio);
       if (!Number.isFinite(safeRatio) || safeRatio <= 0) {
-        return { width: nextWidth, height: nextHeight };
+        return { width: baseWidth, height: baseHeight };
       }
 
-      if (which === 'width') {
-        nextHeight = normalizeOutputSize(nextWidth / safeRatio, nextHeight);
-        if (Math.abs(nextWidth / nextHeight - safeRatio) > 0.75) {
-          nextWidth = normalizeOutputSize(nextHeight * safeRatio, nextWidth);
-        }
-      } else {
-        nextWidth = normalizeOutputSize(nextHeight * safeRatio, nextWidth);
-        if (Math.abs(nextWidth / nextHeight - safeRatio) > 0.75) {
-          nextHeight = normalizeOutputSize(nextWidth / safeRatio, nextHeight);
-        }
+      if (which === 'height') {
+        return {
+          width: normalizeCropSize(baseHeight * safeRatio, baseWidth),
+          height: baseHeight,
+        };
       }
-      return { width: nextWidth, height: nextHeight };
+      return {
+        width: baseWidth,
+        height: normalizeCropSize(baseWidth / safeRatio, baseHeight),
+      };
     }
 
     /**
@@ -1945,13 +2334,13 @@
 
     /* ---------- 缩放数学（纯逻辑，app.js 与测试共用） ---------- */
 
-    /** 缩放范围：10%~1600%，与 engine.js 的 MIN_SCALE / MAX_SCALE 保持一致。 */
-    const ZOOM_MIN = 0.1;
-    const ZOOM_MAX = 16;
+    /** 缩放范围：1%~6400%，与 engine.js 的 MIN_SCALE / MAX_SCALE 保持一致。 */
+    const ZOOM_MIN = 0.01;
+    const ZOOM_MAX = 64;
     const ZOOM_MIN_PERCENT = ZOOM_MIN * 100;
     const ZOOM_MAX_PERCENT = ZOOM_MAX * 100;
 
-    /** 对数滑块的内部刻度：0 对应 10%，1000 对应 1600%。 */
+    /** 对数滑块的内部刻度：0 对应 1%，1000 对应 6400%。 */
     const ZOOM_SLIDER_MAX = 1000;
 
     /** 微调按钮的倍率：普通 1.02，按住 Shift 时 1.005。 */
@@ -1967,9 +2356,7 @@
 
     /** 把缩放值夹到 10%~1600%；非法值回退到 100%。 */
     function clampZoom(scale) {
-      const value = Number(scale);
-      if (!Number.isFinite(value)) return 1;
-      return clamp(value, ZOOM_MIN, ZOOM_MAX);
+      return clampScale(scale);
     }
 
     /** 缩放值 → 百分比数值（未取整，便于继续计算）。 */
@@ -1978,11 +2365,16 @@
     }
 
     /**
-     * 百分比展示：低于 100% 时保留 1 位小数（10.5%），100% 以上取整（137%）。
+     * 百分比展示：1%~6400% 之间的有效数字随量级调整，100% 以上取整。
+     * 低倍率（<10%）保留 2 位小数，保证 6.25% 这类“整图缩进”不会显示成 6.3%。
      * 显示只影响文案，不改变真实缩放值。
      */
     function formatZoomPercent(scale) {
       const percent = zoomPercent(scale);
+      if (percent < 10) {
+        const rounded = Math.round(percent * 100) / 100;
+        return `${Number.isInteger(rounded) ? rounded.toFixed(0) : String(rounded)}%`;
+      }
       if (percent < 100) {
         const rounded = Math.round(percent * 10) / 10;
         return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}%`;
@@ -2108,38 +2500,13 @@
     }
 
     /**
-     * “适应窗口”的缩放值：让整张源图都落在预览画布内。
-     * 推导：viewScale = frame.width / crop.width = frame.width * scale / fitWidth，
-     * 因此源图显示尺寸 = 源图尺寸 * frame.width * scale / fitWidth；
-     * 分别对宽、高解出上限，取较小者，最后夹到 10%~1600%。
+     * “适应窗口”的缩放值：让整张源图落进裁切框。
+     * 新语义下与预览画布大小无关，只由源图和输出尺寸决定：
+     *   scale = min(输出宽 / 源宽, 输出高 / 源高)
+     * 例如 1024×1024 源图、64×64 输出 → 6.25%。
      */
-    function fitZoom(
-      sourceWidth,
-      sourceHeight,
-      outputWidth,
-      outputHeight,
-      viewportWidth,
-      viewportHeight,
-      padding = ZOOM_FRAME_PADDING,
-    ) {
-      const sw = Number(sourceWidth);
-      const sh = Number(sourceHeight);
-      const ow = Number(outputWidth);
-      const oh = Number(outputHeight);
-      if (!(sw > 0) || !(sh > 0) || !(ow > 0) || !(oh > 0)) return 1;
-
-      const aspect = ow / oh;
-      const frame = computeFrame(viewportWidth, viewportHeight, aspect, padding);
-      if (!(frame.width > 0)) return 1;
-
-      const fit = computeCropRect(sw, sh, ow, oh, 1, 0, 0);
-      const pad = Math.max(0, Number(padding) || 0);
-      const availableW = Math.max(40, (Number(viewportWidth) || 1) - pad * 2);
-      const availableH = Math.max(40, (Number(viewportHeight) || 1) - pad * 2);
-
-      const scaleX = (availableW * fit.fitWidth) / (sw * frame.width);
-      const scaleY = (availableH * fit.fitWidth) / (sh * frame.width);
-      return clampZoom(Math.min(scaleX, scaleY));
+    function fitZoom(sourceWidth, sourceHeight, outputWidth, outputHeight) {
+      return fitScale(sourceWidth, sourceHeight, outputWidth, outputHeight);
     }
 
     /**
@@ -2235,7 +2602,7 @@
       );
     }
 
-    Object.assign(__exports, { gcd, aspectLabel, formatBytes, formatPercent, applyAspectLock, buildExportMeta, defaultClipboardName, rangeProgress, ZOOM_MIN, ZOOM_MAX, ZOOM_MIN_PERCENT, ZOOM_MAX_PERCENT, ZOOM_SLIDER_MAX, ZOOM_STEP, ZOOM_STEP_FINE, WHEEL_ZOOM_SENSITIVITY, WHEEL_ZOOM_FINE, ZOOM_FRAME_PADDING, clampZoom, zoomPercent, formatZoomPercent, zoomFromPercent, parseZoomInput, percentToSlider, sliderToPercent, zoomToSlider, sliderToZoom, wheelZoomFactor, zoomStepFactor, stepZoom, zoomShortcut, computeFrame, fitZoom, zoomAroundPoint });
+    Object.assign(__exports, { gcd, aspectLabel, formatBytes, formatPercent, CROP_SIZE_MIN, CROP_SIZE_MAX, parseCropSizeInput, normalizeCropSize, resolveCropSizeEdit, restoreCropSizeSnapshot, stepCropSize, applyAspectLock, buildExportMeta, defaultClipboardName, rangeProgress, ZOOM_MIN, ZOOM_MAX, ZOOM_MIN_PERCENT, ZOOM_MAX_PERCENT, ZOOM_SLIDER_MAX, ZOOM_STEP, ZOOM_STEP_FINE, WHEEL_ZOOM_SENSITIVITY, WHEEL_ZOOM_FINE, ZOOM_FRAME_PADDING, clampZoom, zoomPercent, formatZoomPercent, zoomFromPercent, parseZoomInput, percentToSlider, sliderToPercent, zoomToSlider, sliderToZoom, wheelZoomFactor, zoomStepFactor, stepZoom, zoomShortcut, computeFrame, fitZoom, zoomAroundPoint });
   });
 
   __define("palette-link", function (__exports, __require) {
@@ -2448,11 +2815,11 @@
 
     const { RESAMPLE_METHODS, isValidResample } = __require("resample");
     const { createColorModel, quantize } = __require("quantize");
-    const { computeCropRect, constrainTransform, resampleOutput, resolvePalette, composeOutput, normalizeOutputSize, normalizeRecolorMap } = __require("engine");
+    const { computeCropRect, constrainTransform, convertLegacyScale, resampleOutput, resolvePalette, composeOutput, normalizeOutputSize, normalizeRecolorMap } = __require("engine");
     const { createProject, serializeProject, parseProject, projectSizeBytes } = __require("project");
     const { makePaletteStrip, upscaleImage, encodePNG, buildExportFilename, buildPaletteFilename, buildProjectFilename, sanitizeBaseName } = __require("exporter");
     const { normalizeHex, parseHexPalette, formatHexPalette, clamp } = __require("color");
-    const { applyAspectLock, aspectLabel, buildExportMeta, clampZoom, computeFrame, defaultClipboardName, fitZoom, formatBytes, formatPercent, formatZoomPercent, parseZoomInput, rangeProgress, sliderToZoom, stepZoom, wheelZoomFactor, zoomAroundPoint, zoomPercent, zoomShortcut, zoomToSlider } = __require("uistate");
+    const { aspectLabel, buildExportMeta, clampZoom, computeFrame, defaultClipboardName, fitZoom, formatBytes, formatPercent, formatZoomPercent, parseZoomInput, rangeProgress, resolveCropSizeEdit, restoreCropSizeSnapshot, sliderToZoom, stepCropSize, stepZoom, wheelZoomFactor, zoomAroundPoint, zoomPercent, zoomShortcut, zoomToSlider } = __require("uistate");
     const { buildPaletteLookup, formatPixelInfo, formatPixelSummary, isLargeResult, paletteIndexOfColor, paletteStats, pixelColorAt, previewPointToPixel } = __require("palette-link");
 
     const MAX_UNDO = 50;
@@ -2475,6 +2842,8 @@
       threshold: 0,
       maxColors: 16,
       dither: false,
+      // 区域联动：把孤立零散像素并入相邻主色；旧工程缺省为开。
+      colorSpatial: true,
       recolorMap: {},
       resultZoom: 4,
       exportScale: 1,
@@ -2510,7 +2879,10 @@
     let outputCanvas = null;
     let outputImageData = null;
     let lastTimings = { resample: 0, quantize: 0, compose: 0, total: 0 };
-    let outputTimer = null;
+    // 宽/高输入框的编辑会话：输入过程中只改文本，提交时才写回状态。
+    let sizeEdit = null;
+    // 裁切贴边提示的节流时间戳，避免拖动时反复弹出。
+    let lastClampNotice = 0;
     // 滚轮缩放按帧合并：同一帧内的多个 wheel 事件只重绘 / 重建一次。
     let pendingWheelZoom = null;
     let wheelZoomQueued = false;
@@ -2560,6 +2932,23 @@
       toastTimer = setTimeout(() => {
         el.toast.classList.remove('is-visible');
       }, duration);
+    }
+
+    /** 只把 scale / offset 写回状态，避免把约束结果里的临时标记带进工程。 */
+    function assignTransform(value) {
+      if (!value) return;
+      state.transform.scale = clampZoom(value.scale);
+      state.transform.offsetX = Number(value.offsetX) || 0;
+      state.transform.offsetY = Number(value.offsetY) || 0;
+    }
+
+    /** 裁切被源图边界约束时给出一次书面提示（4 秒内只提示一次）。 */
+    function noticeCropClamped(constrained) {
+      if (!constrained || !constrained.clamped) return;
+      const now = Date.now();
+      if (now - lastClampNotice < 4000) return;
+      lastClampNotice = now;
+      showToast('裁切范围超出图像边界，已尽量靠边。', 'info', 2600);
     }
 
     function markDirty() {
@@ -2632,7 +3021,7 @@
         'btnZoomOut', 'btnZoomIn', 'btnZoomFit', 'btnZoomActual',
         'btnResetCrop', 'resampleSelect', 'resampleDesc', 'thresholdGroup',
         'targetGroup', 'thresholdRange', 'thresholdValue', 'targetColors',
-        'ditherToggle', 'colorCount', 'approxState', 'btnUndoRecolor',
+        'spatialToggle', 'ditherToggle', 'colorCount', 'approxState', 'approxHint', 'btnUndoRecolor',
         'btnResetRecolor', 'exportScale', 'exportFilename', 'exportStats',
         'btnExportPng', 'btnExportPalette', 'sourceWrap', 'sourceCanvas',
         'sourceEmpty', 'btnEmptyImport', 'btnEmptyProject', 'srcInfoBadge',
@@ -2780,6 +3169,12 @@
         scheduleRebuild(false);
       });
 
+      el.spatialToggle.addEventListener('change', () => {
+        state.colorSpatial = el.spatialToggle.checked;
+        markDirty();
+        scheduleRebuild(false);
+      });
+
       el.ditherToggle.addEventListener('change', () => {
         state.dither = el.ditherToggle.checked;
         markDirty();
@@ -2861,54 +3256,59 @@
     }
 
     function setupOutputInput(input, which) {
-      const commit = () => {
-        if (outputTimer) {
-          clearTimeout(outputTimer);
-          outputTimer = null;
-        }
-        applyOutputFromInputs(which);
-      };
-      input.addEventListener('input', () => {
-        if (outputTimer) clearTimeout(outputTimer);
-        outputTimer = setTimeout(commit, 180);
+      // 编辑期间不提交、不钳制、不回写：允许暂时空值或半截数字。
+      input.addEventListener('focus', () => {
+        sizeEdit = {
+          which,
+          width: state.transform.outputWidth,
+          height: state.transform.outputHeight,
+          cancelled: false,
+          committed: false,
+        };
+        input.select();
       });
-      input.addEventListener('change', commit);
-      input.addEventListener('blur', () => {
-        // 输入非法时恢复显示，避免留下空框。
-        if (!Number.isFinite(Number(input.value)) || Number(input.value) < 8 || Number(input.value) > 512) {
-          syncOutputInputs();
+
+      input.addEventListener('input', () => {
+        // 仅保留文本，等失焦 / 回车时再统一规范化。
+      });
+
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          commitSizeEdit(which);
+          input.blur();
+          return;
         }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          cancelSizeEdit();
+          input.blur();
+          return;
+        }
+        // 数字输入框的加/减方向键仍然即时生效；Shift 一次 10。
+        if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+          event.preventDefault();
+          const delta = (event.key === 'ArrowUp' ? 1 : -1) * (event.shiftKey ? 10 : 1);
+          stepSizeEdit(which, delta);
+        }
+      });
+
+      // 原生数字微调按钮（加/减）会立即触发 change；手动输入只在失焦时触发。
+      input.addEventListener('change', () => {
+        if (!sizeEdit || sizeEdit.which !== which) return;
+        if (sizeEdit.cancelled || sizeEdit.committed) return;
+        commitSizeEdit(which);
+      });
+
+      input.addEventListener('blur', () => {
+        if (!sizeEdit || sizeEdit.which !== which) return;
+        if (!sizeEdit.cancelled && !sizeEdit.committed) commitSizeEdit(which);
+        sizeEdit = null;
       });
     }
 
-    function applyOutputFromInputs(which) {
-      if (!state.source) {
-        syncOutputInputs();
-        return;
-      }
-      const widthValue = Number(el.outW.value);
-      const heightValue = Number(el.outH.value);
-      if (!Number.isFinite(widthValue) || !Number.isFinite(heightValue)) {
-        syncOutputInputs();
-        return;
-      }
-
-      let width = normalizeOutputSize(widthValue, state.transform.outputWidth);
-      let height = normalizeOutputSize(heightValue, state.transform.outputHeight);
-
-      if (state.lockAspect) {
-        const locked = applyAspectLock(
-          which,
-          width,
-          height,
-          state.aspectRatio || 1,
-          state.transform.outputWidth,
-          state.transform.outputHeight,
-        );
-        width = locked.width;
-        height = locked.height;
-      }
-
+    /** 把一次尺寸提交应用到裁切状态（同时同步两个输入框）。 */
+    function applyCropSizes(width, height) {
       state.transform.outputWidth = width;
       state.transform.outputHeight = height;
       const constrained = constrainTransform(
@@ -2920,13 +3320,67 @@
         state.transform.offsetX,
         state.transform.offsetY,
       );
-      Object.assign(state.transform, constrained);
+      assignTransform(constrained);
+      noticeCropClamped(constrained);
       syncOutputInputs();
       updateAspectLabel();
       updateSourceInfo();
       markDirty();
       drawSourcePreview();
       scheduleRebuild(true);
+    }
+
+    /** 失焦 / 回车：规范化输入并按锁定比例联动，然后一次性写回。 */
+    function commitSizeEdit(which) {
+      if (!state.source) {
+        syncOutputInputs();
+        return;
+      }
+      const result = resolveCropSizeEdit({
+        which,
+        widthText: el.outW.value,
+        heightText: el.outH.value,
+        currentWidth: state.transform.outputWidth,
+        currentHeight: state.transform.outputHeight,
+        ratio: state.lockAspect ? state.aspectRatio : 0,
+        lockAspect: state.lockAspect,
+      });
+      if (sizeEdit) sizeEdit.committed = true;
+      if (result.invalid) {
+        syncOutputInputs();
+        showToast('宽高需要是 8~512 的整数，已恢复为原来的数值。', 'error', 3200);
+        return;
+      }
+      if (result.changed) applyCropSizes(result.width, result.height);
+      else syncOutputInputs();
+    }
+
+    /** Esc：放弃本次编辑，恢复进入输入框时的状态。 */
+    function cancelSizeEdit() {
+      if (!sizeEdit) return;
+      const snapshot = sizeEdit;
+      const restored = restoreCropSizeSnapshot(snapshot, state.transform.outputWidth, state.transform.outputHeight);
+      sizeEdit = { ...snapshot, cancelled: true, committed: true };
+      if (restored.width !== state.transform.outputWidth || restored.height !== state.transform.outputHeight) {
+        applyCropSizes(restored.width, restored.height);
+      } else {
+        syncOutputInputs();
+      }
+    }
+
+    /** 加/减按钮 / 方向键：基于已提交值立即生效，再同步两个输入框。 */
+    function stepSizeEdit(which, delta) {
+      if (!state.source) return;
+      const result = stepCropSize({
+        which,
+        delta,
+        currentWidth: state.transform.outputWidth,
+        currentHeight: state.transform.outputHeight,
+        ratio: state.lockAspect ? state.aspectRatio : 0,
+        lockAspect: state.lockAspect,
+      });
+      if (result.changed) applyCropSizes(result.width, result.height);
+      else syncOutputInputs();
     }
 
     /* ---------- 导入 / 工程 ---------- */
@@ -3049,6 +3503,7 @@
       state.threshold = 0;
       state.maxColors = 16;
       state.dither = false;
+      state.colorSpatial = true;
       state.recolorMap = {};
       state.resultZoom = 4;
       state.exportScale = 1;
@@ -3090,8 +3545,18 @@
         baseName: sanitizeBaseName(project.sourceName),
       };
 
-      // 缩放百分比以 ui.sourceZoom 为准（旧工程会由 transform.scale 推导）。
-      const restoredScale = clampZoom(project.ui.sourceZoom / 100);
+      // 新工程按 ui.sourceZoom 恢复；旧工程（scaleMode 缺失或为 fit）的
+      // transform.scale 是“相对适应框的倍数”，按新语义自动换算成像素 1:1。
+      const legacyScaleMode = project.transform.scaleMode !== 'pixel';
+      const restoredScale = legacyScaleMode
+        ? convertLegacyScale(
+          project.transform.scale,
+          imageData.width,
+          imageData.height,
+          project.transform.outputWidth,
+          project.transform.outputHeight,
+        )
+        : clampZoom(project.ui.sourceZoom / 100);
       const constrained = constrainTransform(
         imageData.width,
         imageData.height,
@@ -3103,7 +3568,9 @@
       );
 
       state.transform = {
-        ...constrained,
+        scale: constrained.scale,
+        offsetX: constrained.offsetX,
+        offsetY: constrained.offsetY,
         outputWidth: project.transform.outputWidth,
         outputHeight: project.transform.outputHeight,
       };
@@ -3114,6 +3581,7 @@
       state.threshold = project.threshold;
       state.maxColors = project.maxColors;
       state.dither = project.dither;
+      state.colorSpatial = project.colorSpatial;
       state.recolorMap = normalizeRecolorMap(project.recolorMap);
       state.resultZoom = project.ui.resultZoom;
       state.exportScale = project.ui.exportScale;
@@ -3152,6 +3620,9 @@
         }
       }
 
+      if (legacyScaleMode) {
+        showToast('旧工程的缩放已按新的 1:1 口径自动换算，如与预期不同可重新调整。', 'info', 5000);
+      }
       if (!options.quiet) showToast('工程已加载', 'success');
       return project;
     }
@@ -3322,7 +3793,8 @@
         state.transform.offsetX,
         state.transform.offsetY,
       );
-      Object.assign(state.transform, constrained);
+      assignTransform(constrained);
+      noticeCropClamped(constrained);
       markDirty();
       updateSourceInfo();
       drawSourcePreview();
@@ -3396,7 +3868,8 @@
 
     /** 应用缩放结果：同步控件、按帧重绘预览与结果。 */
     function applyZoomTransform(transform) {
-      Object.assign(state.transform, transform);
+      assignTransform(transform);
+      noticeCropClamped(transform);
       syncZoomControls();
       markDirty();
       scheduleSourceDraw();
@@ -3442,14 +3915,11 @@
     /** 适应窗口：让整张源图落入预览区并居中。 */
     function fitSourceToView() {
       if (!state.source) return;
-      const rect = el.sourceWrap.getBoundingClientRect();
       const scale = fitZoom(
         state.source.width,
         state.source.height,
         state.transform.outputWidth,
         state.transform.outputHeight,
-        rect.width,
-        rect.height,
       );
       applySourceZoom(scale, 0, 0);
     }
@@ -3491,6 +3961,7 @@
         state.threshold,
         state.maxColors,
         state.dither ? 1 : 0,
+        state.colorSpatial ? 1 : 0,
       ].join('|');
     }
 
@@ -3554,6 +4025,7 @@
             threshold: state.threshold,
             maxColors: state.maxColors,
             dither: state.dither,
+            spatial: state.colorSpatial,
             model: cache.model,
           });
           cache.quantKey = qKey;
@@ -3592,7 +4064,7 @@
         el.topStatus.textContent = `${state.transform.outputWidth}×${state.transform.outputHeight} · ${finalPalette.length} 色`;
         setStatus('预览已更新');
         if (cache.quantized.approximate) {
-          el.approxState.title = '颜色数量过多，本次结果做了近似处理以保持操作流畅';
+          el.approxState.title = '颜色较多，已启用近似加速，个别颜色可能略有偏差';
         } else {
           el.approxState.removeAttribute('title');
         }
@@ -4101,15 +4573,17 @@
       el.resultColors.textContent = `${finalPalette.length} 色`;
       el.colorCount.textContent = String(finalPalette.length);
       if (cache.quantized) {
-        el.approxState.textContent = cache.quantized.approximate ? '近似' : '精确';
+        el.approxState.textContent = cache.quantized.approximate ? '近似加速' : '精确';
+        el.approxHint.hidden = !cache.quantized.approximate;
       } else {
         el.approxState.textContent = '精确';
+        el.approxHint.hidden = true;
       }
       el.paletteCount.textContent = `${finalPalette.length} 色`;
       if (finalPalette.length) {
         const changed = finalPalette.filter((entry) => entry.changed).length;
         if (cache.quantized?.approximate) {
-          el.paletteHint.textContent = '近似';
+          el.paletteHint.textContent = '近似加速';
         } else if (changed) {
           el.paletteHint.textContent = `已改色 ${changed}`;
         } else {
@@ -4237,6 +4711,7 @@
       updateModeUI();
       updateThresholdUI();
       el.targetColors.value = String(state.maxColors);
+      el.spatialToggle.checked = state.colorSpatial;
       el.ditherToggle.checked = state.dither;
       el.exportScale.value = String(state.exportScale);
       el.hoverHighlight.checked = state.hoverHighlight;
@@ -4275,6 +4750,9 @@
       const isTarget = state.colorMode === 'target';
       el.thresholdGroup.classList.toggle('is-hidden', isTarget);
       el.targetGroup.classList.toggle('is-hidden', !isTarget);
+      // 区域联动只作用于相近色合并模式；指定色数时保留开关状态但暂不可用。
+      el.spatialToggle.disabled = isTarget;
+      el.spatialToggle.closest('.check-line')?.classList.toggle('is-disabled', isTarget);
     }
 
     function updateThresholdUI() {
@@ -4408,6 +4886,7 @@
         threshold: state.threshold,
         maxColors: state.maxColors,
         dither: state.dither,
+        colorSpatial: state.colorSpatial,
         palette: cache.quantized.palette.map((entry) => entry.hex),
         recolorMap: { ...state.recolorMap },
         manualPalette: finalPalette.map((entry) => entry.hex),
@@ -4554,11 +5033,14 @@
         threshold: state.threshold,
         maxColors: state.maxColors,
         dither: state.dither,
+        colorSpatial: state.colorSpatial,
         recolorMap: { ...state.recolorMap },
         resultZoom: state.resultZoom,
         hoverHighlight: state.hoverHighlight,
         colors: finalPalette.length,
         approximate: Boolean(cache.quantized?.approximate),
+        spatial: Boolean(cache.quantized?.spatial),
+        spatialMoved: cache.quantized?.spatialMoved ?? 0,
         timings: { ...lastTimings },
         palette: finalPalette.map((entry) => ({
           hex: entry.hex,
@@ -4586,6 +5068,13 @@
         setThreshold(value) {
           state.colorMode = 'threshold';
           state.threshold = clamp(Number(value) || 0, 0, 100);
+          syncAllControls();
+          markDirty();
+          rebuildPipeline();
+          return getDebugState();
+        },
+        setSpatial(value) {
+          state.colorSpatial = Boolean(value);
           syncAllControls();
           markDirty();
           rebuildPipeline();

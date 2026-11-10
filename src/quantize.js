@@ -1,11 +1,14 @@
 // 色阶简化 / 颜色量化。
 //
-// 阈值模式：把颜色看作 CIELAB 空间中的点，用大小随阈值变化的网格 + 并查集
-// 求“距离小于阈值”图的连通分量（单链接层次聚类）。网格单元的对角线严格小于
-// 阈值，因此同格颜色必然合并；只需检查相邻 ±2 格即可保证不漏边。这样比
-// O(n²) 的完整 MST 快得多，同时颜色数量随阈值单调不增。
+// 阈值模式：把颜色看作 CIELAB 空间中的点，建立一棵与阈值无关的固定划分树，
+// 再按“簇内任意两色的 ΔE 不超过阈值”自上而下切割。小簇精确检查最大两两
+// 距离，大簇用 2 × 簇心到最远成员距离作上界，因此不会出现 A~B、B~C 就把
+// A、C 链式并在一起的单链接问题。树只由颜色数据决定，所以颜色数随阈值单调不增。
 //
 // 目标色数模式：带权 k-means++（LAB 空间），固定随机种子，结果可重现。
+//
+// 区域联动：聚类完成后，把“局部孤立、且与邻域主色簇心距离很近”的零散像素
+// 并入邻域主色簇，让像素画里成片的同色更完整；固定扫描顺序，结果确定。
 //
 // 抖动：可选的 Floyd–Steinberg 误差扩散（RGB 空间，默认关闭）。
 
@@ -20,39 +23,21 @@ import {
 
 export const TRANSPARENT_INDEX = 0xffffffff;
 
-// 精确颜色超过该数量时，阈值/目标色数模式改用 4bit/通道的预聚合模型。
-// 64×64 输出最多只有 4096 种颜色，因此正常像素画工作流不会触发。
+// 精确颜色超过该数量时，阈值/目标色数模式改用 5bit/通道的预聚合模型。
+// 阈值 ≤ 2 时为了保证“只合并极少数近似色”，仍然使用精确颜色。
 export const MAX_EXACT_COLORS = 7000;
 
-const BIN_COUNT = 16 * 16 * 16;
+/** 低于等于该阈值时不启用预聚合，避免把阈值 1 的少量近似色提前粗暴合并。 */
+export const PRECISE_THRESHOLD_LIMIT = 2;
 
-class UnionFind {
-  constructor(size) {
-    this.parent = new Int32Array(size);
-    this.rank = new Uint8Array(size);
-    for (let i = 0; i < size; i += 1) this.parent[i] = i;
-  }
+// 5bit/通道：32×32×32 = 32768 个格子，比 4bit 精细 8 倍。
+const BIN_BITS = 5;
+const BIN_SHIFT = 8 - BIN_BITS;
+const BIN_LEVELS = 1 << BIN_BITS;
+const BIN_COUNT = BIN_LEVELS * BIN_LEVELS * BIN_LEVELS;
 
-  find(value) {
-    let root = value;
-    while (this.parent[root] !== root) root = this.parent[root];
-    while (this.parent[value] !== value) {
-      const next = this.parent[value];
-      this.parent[value] = root;
-      value = next;
-    }
-    return root;
-  }
-
-  union(a, b) {
-    let rootA = this.find(a);
-    let rootB = this.find(b);
-    if (rootA === rootB) return false;
-    if (this.rank[rootA] < this.rank[rootB]) [rootA, rootB] = [rootB, rootA];
-    this.parent[rootB] = rootA;
-    if (this.rank[rootA] === this.rank[rootB]) this.rank[rootA] += 1;
-    return true;
-  }
+function binKey(r, g, b) {
+  return ((r >> BIN_SHIFT) << (BIN_BITS * 2)) | ((g >> BIN_SHIFT) << BIN_BITS) | (b >> BIN_SHIFT);
 }
 
 function validateImage(image) {
@@ -110,7 +95,7 @@ export function createColorModel(image, options = {}) {
       const offset = i * 4;
       if (data[offset + 3] === 0) continue;
       opaquePixels += 1;
-      const key = ((data[offset] >> 4) << 8) | ((data[offset + 1] >> 4) << 4) | (data[offset + 2] >> 4);
+      const key = binKey(data[offset], data[offset + 1], data[offset + 2]);
       counts[key] += 1;
       sumR[key] += data[offset];
       sumG[key] += data[offset + 1];
@@ -121,6 +106,7 @@ export function createColorModel(image, options = {}) {
     for (let key = 0; key < BIN_COUNT; key += 1) {
       if (!counts[key]) continue;
       const count = counts[key];
+      // 每个候选色的真实位置仍然是该格内所有真实像素的均值。
       const r = Math.round(sumR[key] / count);
       const g = Math.round(sumG[key] / count);
       const b = Math.round(sumB[key] / count);
@@ -163,6 +149,255 @@ function paletteEntryFromColor(r, g, b, count) {
   return { r, g, b, hex: rgbToHex(r, g, b), count };
 }
 
+// 半径受限的层次划分：
+// - 划分树只由颜色数据决定、与阈值无关，因此阈值越高只会把节点从“继续分”
+//   改为“合并”，颜色数必然单调不增；
+// - 每个节点记录簇内任意两色的最大距离（小簇精确计算，大簇用 2 × 半径作
+//   上界），只有该距离 ≤ 阈值时才允许整块保留，所以不会出现 A~B、B~C 就把
+//   A、C 链式并进来的情况；
+// - 划分时优先在颜色分布的空隙处切开，避免把同一团相近色拆到两个分支里。
+const EXACT_DIAMETER_LIMIT = 64;
+const MAX_HIERARCHY_DEPTH = 128;
+// 同一份颜色模型在阈值滑动时复用这棵树，避免重复计算。
+const hierarchyCache = new WeakMap();
+
+/** 计算区间内颜色在 LAB 各轴上的跨度，返回跨度最大的轴与跨度。 */
+function widestRange(order, start, end, labs) {
+  let minL = Number.POSITIVE_INFINITY;
+  let maxL = Number.NEGATIVE_INFINITY;
+  let minA = Number.POSITIVE_INFINITY;
+  let maxA = Number.NEGATIVE_INFINITY;
+  let minB = Number.POSITIVE_INFINITY;
+  let maxB = Number.NEGATIVE_INFINITY;
+  for (let i = start; i < end; i += 1) {
+    const offset = order[i] * 3;
+    const l = labs[offset];
+    const a = labs[offset + 1];
+    const b = labs[offset + 2];
+    if (l < minL) minL = l;
+    if (l > maxL) maxL = l;
+    if (a < minA) minA = a;
+    if (a > maxA) maxA = a;
+    if (b < minB) minB = b;
+    if (b > maxB) maxB = b;
+  }
+  const ranges = [maxL - minL, maxA - minA, maxB - minB];
+  let dimension = 0;
+  if (ranges[1] > ranges[dimension]) dimension = 1;
+  if (ranges[2] > ranges[dimension]) dimension = 2;
+  return { dimension, range: ranges[dimension] };
+}
+
+/**
+ * 在区间内选择切分点。
+ * 优先选两侧成员都不太少的最大空隙；若某个空隙特别大（≥ 全跨度的 1/4），
+ * 即使一侧成员很少也允许切开，这样远离主色的少量颜色不会把整团相近色拆散。
+ * 深度过大时退回中位切分，保证树深有上界。
+ */
+function chooseSplit(order, start, end, labs, depth) {
+  if (end - start <= 1) return -1;
+  const { dimension, range } = widestRange(order, start, end, labs);
+  if (!(range > 1e-9)) return -1;
+
+  const view = order.subarray(start, end);
+  view.sort((left, right) => {
+    const delta = labs[left * 3 + dimension] - labs[right * 3 + dimension];
+    return delta !== 0 ? delta : left - right;
+  });
+
+  const length = end - start;
+  if (depth >= MAX_HIERARCHY_DEPTH) return start + (length >> 1);
+
+  const minSide = length <= 24 ? 1 : Math.max(1, Math.floor(length * 0.05));
+  const hugeGap = range * 0.25;
+  let bestPosition = -1;
+  let bestGap = -1;
+  for (let i = 1; i < length; i += 1) {
+    const gap = labs[order[start + i] * 3 + dimension] - labs[order[start + i - 1] * 3 + dimension];
+    const side = Math.min(i, length - i);
+    if (side < minSide && gap < hugeGap) continue;
+    if (gap > bestGap + 1e-12) {
+      bestGap = gap;
+      bestPosition = i;
+    } else if (Math.abs(gap - bestGap) <= 1e-12) {
+      // 空隙相同时取更靠近中间的位置，避免树退化成一条链。
+      const previous = Math.abs(bestPosition - length / 2);
+      const current = Math.abs(i - length / 2);
+      if (current < previous) bestPosition = i;
+    }
+  }
+  if (bestPosition <= 0) bestPosition = length >> 1;
+  return start + bestPosition;
+}
+
+/**
+ * 建立与阈值无关的颜色划分树。节点成员用 order[start, end) 表示；
+ * 区间在构造过程中被重排成连续块，因此不需要为每个节点保存成员数组。
+ */
+function buildColorHierarchy(model) {
+  const { entries, labs } = model;
+  const n = entries.length;
+  if (n === 0) return null;
+
+  const order = new Uint32Array(n);
+  for (let i = 0; i < n; i += 1) order[i] = i;
+
+  const capacity = Math.max(1, n * 2 - 1);
+  const starts = new Uint32Array(capacity);
+  const ends = new Uint32Array(capacity);
+  const centers = new Float64Array(capacity * 3);
+  const weights = new Float64Array(capacity);
+  // 簇内最大两两距离的平方（小簇精确值，大簇用上界）。
+  const extents = new Float64Array(capacity);
+  const lefts = new Int32Array(capacity).fill(-1);
+  const rights = new Int32Array(capacity).fill(-1);
+  const depths = new Uint16Array(capacity);
+  let nodeCount = 0;
+
+  function createNode(start, end, depth) {
+    let weight = 0;
+    let sumL = 0;
+    let sumA = 0;
+    let sumB = 0;
+    for (let i = start; i < end; i += 1) {
+      const index = order[i];
+      const count = entries[index].count;
+      const offset = index * 3;
+      weight += count;
+      sumL += labs[offset] * count;
+      sumA += labs[offset + 1] * count;
+      sumB += labs[offset + 2] * count;
+    }
+    const centerL = sumL / weight;
+    const centerA = sumA / weight;
+    const centerB = sumB / weight;
+
+    // 先算 2 × 最大半径作为平方上界；成员较少时再算精确的最大两两距离，
+    // 避免“近似圆”被上界误判为超过阈值而多切一刀。
+    let maxRadiusSq = 0;
+    for (let i = start; i < end; i += 1) {
+      const offset = order[i] * 3;
+      const dl = labs[offset] - centerL;
+      const da = labs[offset + 1] - centerA;
+      const db = labs[offset + 2] - centerB;
+      const distanceSq = dl * dl + da * da + db * db;
+      if (distanceSq > maxRadiusSq) maxRadiusSq = distanceSq;
+    }
+    let extent = 4 * maxRadiusSq;
+
+    const length = end - start;
+    if (length > 1 && length <= EXACT_DIAMETER_LIMIT) {
+      let exact = 0;
+      for (let i = start; i < end; i += 1) {
+        const leftOffset = order[i] * 3;
+        const ll = labs[leftOffset];
+        const la = labs[leftOffset + 1];
+        const lb = labs[leftOffset + 2];
+        for (let j = i + 1; j < end; j += 1) {
+          const rightOffset = order[j] * 3;
+          const dl = ll - labs[rightOffset];
+          const da = la - labs[rightOffset + 1];
+          const db = lb - labs[rightOffset + 2];
+          const distanceSq = dl * dl + da * da + db * db;
+          if (distanceSq > exact) exact = distanceSq;
+        }
+      }
+      if (exact < extent) extent = exact;
+    }
+
+    const id = nodeCount;
+    nodeCount += 1;
+    starts[id] = start;
+    ends[id] = end;
+    centers[id * 3] = centerL;
+    centers[id * 3 + 1] = centerA;
+    centers[id * 3 + 2] = centerB;
+    weights[id] = weight;
+    extents[id] = extent;
+    depths[id] = depth;
+    return id;
+  }
+
+  const root = createNode(0, n, 0);
+  const stack = [root];
+  while (stack.length) {
+    const node = stack.pop();
+    const start = starts[node];
+    const end = ends[node];
+    if (end - start <= 1 || extents[node] <= 1e-12) continue;
+    const middle = chooseSplit(order, start, end, labs, depths[node]);
+    if (middle <= start || middle >= end) continue;
+    const left = createNode(start, middle, depths[node] + 1);
+    const right = createNode(middle, end, depths[node] + 1);
+    lefts[node] = left;
+    rights[node] = right;
+    stack.push(left, right);
+  }
+
+  return { order, starts, ends, centers, weights, extents, lefts, rights };
+}
+
+function hierarchyFor(model) {
+  let hierarchy = hierarchyCache.get(model);
+  if (!hierarchy) {
+    hierarchy = buildColorHierarchy(model);
+    if (hierarchy) hierarchyCache.set(model, hierarchy);
+  }
+  return hierarchy;
+}
+
+/** 按阈值自上而下切树：节点内最大色差 ≤ 阈值就整块保留，否则继续分。 */
+function collectThresholdClusters(model, threshold) {
+  const hierarchy = hierarchyFor(model);
+  if (!hierarchy) return [];
+  const limitSq = threshold * threshold + 1e-9;
+  const output = [];
+  const stack = [0];
+  while (stack.length) {
+    const node = stack.pop();
+    if (hierarchy.extents[node] <= limitSq || hierarchy.lefts[node] === -1) {
+      output.push(node);
+      continue;
+    }
+    stack.push(hierarchy.rights[node], hierarchy.lefts[node]);
+  }
+  return output;
+}
+
+function clustersToPalette(model, hierarchy, clusterNodes) {
+  const n = model.entries.length;
+  const uniqueToPalette = new Uint32Array(n);
+  const palette = [];
+  const ordered = clusterNodes.slice().sort((left, right) => (
+    hierarchy.weights[right] - hierarchy.weights[left]
+    || hierarchy.centers[left * 3] - hierarchy.centers[right * 3]
+  ));
+
+  ordered.forEach((node, paletteIndex) => {
+    const start = hierarchy.starts[node];
+    const end = hierarchy.ends[node];
+    let r;
+    let g;
+    let b;
+    if (end - start === 1) {
+      const only = model.entries[hierarchy.order[start]];
+      r = only.r;
+      g = only.g;
+      b = only.b;
+    } else {
+      [r, g, b] = labToRgb(
+        hierarchy.centers[node * 3],
+        hierarchy.centers[node * 3 + 1],
+        hierarchy.centers[node * 3 + 2],
+      );
+    }
+    palette.push(paletteEntryFromColor(r, g, b, hierarchy.weights[node]));
+    for (let i = start; i < end; i += 1) uniqueToPalette[hierarchy.order[i]] = paletteIndex;
+  });
+
+  return { palette, uniqueToPalette };
+}
+
 function thresholdClusters(model, threshold) {
   const n = model.entries.length;
   const uniqueToPalette = new Uint32Array(n);
@@ -176,123 +411,9 @@ function thresholdClusters(model, threshold) {
     return { palette, uniqueToPalette };
   }
 
-  const labs = model.labs;
-  const uf = new UnionFind(n);
-
-  // 单元对角线严格小于阈值，保证同格颜色两两距离 < 阈值。
-  const cellSize = threshold / (Math.sqrt(3) * 1.000001);
-  const cells = new Map();
-  for (let i = 0; i < n; i += 1) {
-    const cx = Math.floor(labs[i * 3] / cellSize);
-    const cy = Math.floor(labs[i * 3 + 1] / cellSize);
-    const cz = Math.floor(labs[i * 3 + 2] / cellSize);
-    const key = `${cx},${cy},${cz}`;
-    let cell = cells.get(key);
-    if (!cell) {
-      cell = { cx, cy, cz, members: [] };
-      cells.set(key, cell);
-    }
-    cell.members.push(i);
-  }
-
-  // 同格颜色必然在同一连通分量。
-  for (const cell of cells.values()) {
-    if (cell.members.length < 2) continue;
-    const first = cell.members[0];
-    for (let m = 1; m < cell.members.length; m += 1) {
-      uf.union(first, cell.members[m]);
-    }
-  }
-
-  // 只需检查正方向的 ±2 格邻域；每个无序格对只检查一次。
-  const offsets = [];
-  for (let dx = -2; dx <= 2; dx += 1) {
-    for (let dy = -2; dy <= 2; dy += 1) {
-      for (let dz = -2; dz <= 2; dz += 1) {
-        if (dx === 0 && dy === 0 && dz === 0) continue;
-        if (dx > 0 || (dx === 0 && dy > 0) || (dx === 0 && dy === 0 && dz > 0)) {
-          offsets.push([dx, dy, dz]);
-        }
-      }
-    }
-  }
-
-  const limit = threshold * threshold;
-  for (const cell of cells.values()) {
-    for (const [dx, dy, dz] of offsets) {
-      const other = cells.get(`${cell.cx + dx},${cell.cy + dy},${cell.cz + dz}`);
-      if (!other) continue;
-      if (uf.find(other.members[0]) === uf.find(cell.members[0])) continue;
-
-      let merged = false;
-      for (const a of cell.members) {
-        const a3 = a * 3;
-        const al = labs[a3];
-        const aa = labs[a3 + 1];
-        const ab = labs[a3 + 2];
-        for (const b of other.members) {
-          const b3 = b * 3;
-          const dl = al - labs[b3];
-          const da = aa - labs[b3 + 1];
-          const db = ab - labs[b3 + 2];
-          if (dl * dl + da * da + db * db < limit) {
-            uf.union(a, b);
-            merged = true;
-            break;
-          }
-        }
-        if (merged) break;
-      }
-    }
-  }
-
-  const groups = new Map();
-  for (let i = 0; i < n; i += 1) {
-    const root = uf.find(i);
-    let members = groups.get(root);
-    if (!members) {
-      members = [];
-      groups.set(root, members);
-    }
-    members.push(i);
-  }
-
-  const clusters = [];
-  for (const members of groups.values()) {
-    let count = 0;
-    let sumL = 0;
-    let sumA = 0;
-    let sumB = 0;
-    for (const index of members) {
-      const entry = model.entries[index];
-      const countWeight = entry.count;
-      count += countWeight;
-      sumL += model.labs[index * 3] * countWeight;
-      sumA += model.labs[index * 3 + 1] * countWeight;
-      sumB += model.labs[index * 3 + 2] * countWeight;
-    }
-
-    let r;
-    let g;
-    let b;
-    if (members.length === 1) {
-      const only = model.entries[members[0]];
-      r = only.r;
-      g = only.g;
-      b = only.b;
-    } else {
-      [r, g, b] = labToRgb(sumL / count, sumA / count, sumB / count);
-    }
-    clusters.push({ color: paletteEntryFromColor(r, g, b, count), members, count });
-  }
-
-  clusters.sort((a, b) => b.count - a.count || a.color.hex.localeCompare(b.color.hex));
-  const palette = clusters.map((cluster, paletteIndex) => {
-    for (const member of cluster.members) uniqueToPalette[member] = paletteIndex;
-    return cluster.color;
-  });
-
-  return { palette, uniqueToPalette };
+  const hierarchy = hierarchyFor(model);
+  const clusters = collectThresholdClusters(model, threshold);
+  return clustersToPalette(model, hierarchy, clusters);
 }
 
 function mulberry32(seed) {
@@ -543,7 +664,7 @@ function buildIndices(image, model, uniqueToPalette) {
     for (let i = 0; i < width * height; i += 1) {
       const offset = i * 4;
       if (data[offset + 3] === 0) continue;
-      const key = ((data[offset] >> 4) << 8) | ((data[offset + 1] >> 4) << 4) | (data[offset + 2] >> 4);
+      const key = binKey(data[offset], data[offset + 1], data[offset + 2]);
       const entryIndex = binLookup[key];
       if (entryIndex >= 0) indices[i] = uniqueToPalette[entryIndex];
     }
@@ -559,6 +680,110 @@ function buildIndices(image, model, uniqueToPalette) {
     if (entryIndex !== undefined) indices[i] = uniqueToPalette[entryIndex];
   }
   return indices;
+}
+
+// 区域联动时允许并入邻域主色的最大色差。ΔE 3 约为人眼可察觉的差异下限，
+// 超过它就可能把用户有意保留的两种颜色抹成一种，因此即使阈值很高也到此为止。
+const SPATIAL_MAX_DELTA = 3;
+
+/**
+ * 区域联动：把局部孤立的零散像素并入邻域主色簇。
+ *
+ * 规则（全部确定性）：
+ * - 按行优先固定顺序扫描，每轮基于上一轮快照判断，最多 2 轮；
+ * - 只处理 8 邻域里没有任何同簇像素的孤立像素；
+ * - 邻域主色簇需占可见邻域的 60% 以上（角落至少 3 个邻居）；
+ * - 当前簇与邻域主色簇的簇心色差需不超过 min(阈值, 3)；
+ * - 棋盘格像素在斜向有同簇邻居，不会被改动；成片区域内部也不会被改动。
+ *
+ * @param {{data:Uint8ClampedArray|Uint8Array,width:number,height:number}} image
+ * @param {Uint32Array} indices 聚类后的调色板索引
+ * @param {Array<{r:number,g:number,b:number}>} palette 调色板
+ * @param {number} threshold 阈值（ΔE）；≤0 时不生效
+ * @param {number} [rounds=2] 平滑轮数（1~2）
+ * @returns {{indices:Uint32Array, moved:number}}
+ */
+export function smoothSpatialIndices(image, indices, palette, threshold, rounds = 2) {
+  const result = new Uint32Array(indices);
+  if (!(threshold > 0) || !palette || palette.length < 2) {
+    return { indices: result, moved: 0 };
+  }
+
+  const { width, height, data } = image;
+  const labs = new Float64Array(palette.length * 3);
+  for (let i = 0; i < palette.length; i += 1) {
+    const lab = rgbToLab(palette[i].r, palette[i].g, palette[i].b);
+    labs[i * 3] = lab[0];
+    labs[i * 3 + 1] = lab[1];
+    labs[i * 3 + 2] = lab[2];
+  }
+
+  const limitSq = Math.min(threshold, SPATIAL_MAX_DELTA) ** 2;
+  const neighborOffsets = [
+    [-1, -1], [0, -1], [1, -1],
+    [-1, 0], [1, 0],
+    [-1, 1], [0, 1], [1, 1],
+  ];
+  const counts = new Uint32Array(palette.length);
+  const touched = [];
+  let movedTotal = 0;
+
+  const roundCount = Math.max(1, Math.min(2, Math.round(rounds)));
+  for (let round = 0; round < roundCount; round += 1) {
+    const snapshot = result.slice();
+    let moved = 0;
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const pixel = y * width + x;
+        if (data[pixel * 4 + 3] === 0) continue;
+        const self = snapshot[pixel];
+        if (self === TRANSPARENT_INDEX) continue;
+
+        let sameNeighbors = 0;
+        let visibleNeighbors = 0;
+        let bestIndex = -1;
+        let bestCount = 0;
+        touched.length = 0;
+        for (const [dx, dy] of neighborOffsets) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          const neighbor = ny * width + nx;
+          if (data[neighbor * 4 + 3] === 0) continue;
+          visibleNeighbors += 1;
+          const index = snapshot[neighbor];
+          if (index === TRANSPARENT_INDEX) continue;
+          if (index === self) {
+            sameNeighbors += 1;
+            continue;
+          }
+          if (counts[index] === 0) touched.push(index);
+          counts[index] += 1;
+          if (counts[index] > bestCount
+            || (counts[index] === bestCount && (bestIndex < 0 || index < bestIndex))) {
+            bestCount = counts[index];
+            bestIndex = index;
+          }
+        }
+        for (const index of touched) counts[index] = 0;
+
+        if (sameNeighbors > 0 || bestIndex < 0) continue;
+        const required = Math.max(3, Math.ceil(visibleNeighbors * 0.6));
+        if (bestCount < required) continue;
+        const self3 = self * 3;
+        const best3 = bestIndex * 3;
+        const dl = labs[self3] - labs[best3];
+        const da = labs[self3 + 1] - labs[best3 + 1];
+        const db = labs[self3 + 2] - labs[best3 + 2];
+        if (dl * dl + da * da + db * db > limitSq + 1e-9) continue;
+        result[pixel] = bestIndex;
+        moved += 1;
+      }
+    }
+    movedTotal += moved;
+    if (moved === 0) break;
+  }
+  return { indices: result, moved: movedTotal };
 }
 
 /** 计算实际使用到的调色板颜色并删除零占比颜色，同时重映射索引。 */
@@ -612,6 +837,7 @@ function modelMatches(image, model) {
  *   threshold?: number,
  *   maxColors?: number,
  *   dither?: boolean,
+ *   spatial?: boolean,
  *   model?: object
  * }} options
  */
@@ -621,12 +847,15 @@ export function quantize(image, options = {}) {
   const threshold = clamp(Number(options.threshold) || 0, 0, 100);
   const maxColors = Math.max(1, Math.min(256, Math.round(Number(options.maxColors) || 16)));
   const dither = Boolean(options.dither);
+  const spatial = Boolean(options.spatial);
 
   let model = modelMatches(image, options.model) ? options.model : createColorModel(image);
   let approximate = false;
   const needsClustering = mode === 'target' || threshold > 0;
+  // 阈值 ≤ 2 时即使颜色很多也不用预聚合，保证“阈值 1 只合并极少数近似色”。
+  const allowPreaggregate = mode === 'target' || threshold > PRECISE_THRESHOLD_LIMIT;
 
-  if (needsClustering && model.entries.length > MAX_EXACT_COLORS && model.kind === 'exact') {
+  if (needsClustering && allowPreaggregate && model.entries.length > MAX_EXACT_COLORS && model.kind === 'exact') {
     if (!model.binnedFallback) {
       model.binnedFallback = createColorModel(image, { binned: true });
     }
@@ -639,6 +868,15 @@ export function quantize(image, options = {}) {
     : thresholdClusters(model, threshold);
 
   let indices = buildIndices(image, model, clusters.uniqueToPalette);
+  let spatialApplied = false;
+  let spatialMoved = 0;
+  // 抖动会把像素刻意打散，与区域联动的目标冲突，因此抖动开启时不参与。
+  if (spatial && !dither && mode === 'threshold' && threshold > 0) {
+    const smoothed = smoothSpatialIndices(image, indices, clusters.palette, threshold);
+    indices = smoothed.indices;
+    spatialMoved = smoothed.moved;
+    spatialApplied = true;
+  }
   if (dither) {
     indices = ditherIndices(image, clusters.palette);
   }
@@ -651,6 +889,8 @@ export function quantize(image, options = {}) {
     threshold,
     maxColors,
     dither,
+    spatial: spatialApplied,
+    spatialMoved,
     palette,
     indices,
     colorCount: palette.length,

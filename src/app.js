@@ -88,6 +88,8 @@ const state = {
   threshold: 0,
   maxColors: 16,
   dither: false,
+  // 区域联动：把孤立零散像素并入相邻主色；旧工程缺省为开。
+  colorSpatial: true,
   recolorMap: {},
   resultZoom: 4,
   exportScale: 1,
@@ -265,7 +267,7 @@ function cacheElements() {
     'btnZoomOut', 'btnZoomIn', 'btnZoomFit', 'btnZoomActual',
     'btnResetCrop', 'resampleSelect', 'resampleDesc', 'thresholdGroup',
     'targetGroup', 'thresholdRange', 'thresholdValue', 'targetColors',
-    'ditherToggle', 'colorCount', 'approxState', 'btnUndoRecolor',
+    'spatialToggle', 'ditherToggle', 'colorCount', 'approxState', 'approxHint', 'btnUndoRecolor',
     'btnResetRecolor', 'exportScale', 'exportFilename', 'exportStats',
     'btnExportPng', 'btnExportPalette', 'sourceWrap', 'sourceCanvas',
     'sourceEmpty', 'btnEmptyImport', 'btnEmptyProject', 'srcInfoBadge',
@@ -409,6 +411,12 @@ function bindEvents() {
   el.targetColors.addEventListener('change', () => {
     state.maxColors = Math.max(2, Math.min(256, Math.round(Number(el.targetColors.value) || 16)));
     el.targetColors.value = String(state.maxColors);
+    markDirty();
+    scheduleRebuild(false);
+  });
+
+  el.spatialToggle.addEventListener('change', () => {
+    state.colorSpatial = el.spatialToggle.checked;
     markDirty();
     scheduleRebuild(false);
   });
@@ -741,6 +749,7 @@ function resetWorkspaceForSource() {
   state.threshold = 0;
   state.maxColors = 16;
   state.dither = false;
+  state.colorSpatial = true;
   state.recolorMap = {};
   state.resultZoom = 4;
   state.exportScale = 1;
@@ -818,6 +827,7 @@ async function loadProjectText(text, options = {}) {
   state.threshold = project.threshold;
   state.maxColors = project.maxColors;
   state.dither = project.dither;
+  state.colorSpatial = project.colorSpatial;
   state.recolorMap = normalizeRecolorMap(project.recolorMap);
   state.resultZoom = project.ui.resultZoom;
   state.exportScale = project.ui.exportScale;
@@ -1197,6 +1207,7 @@ function quantSignature(geometryKey) {
     state.threshold,
     state.maxColors,
     state.dither ? 1 : 0,
+    state.colorSpatial ? 1 : 0,
   ].join('|');
 }
 
@@ -1260,6 +1271,7 @@ function rebuildPipeline() {
         threshold: state.threshold,
         maxColors: state.maxColors,
         dither: state.dither,
+        spatial: state.colorSpatial,
         model: cache.model,
       });
       cache.quantKey = qKey;
@@ -1298,7 +1310,7 @@ function rebuildPipeline() {
     el.topStatus.textContent = `${state.transform.outputWidth}×${state.transform.outputHeight} · ${finalPalette.length} 色`;
     setStatus('预览已更新');
     if (cache.quantized.approximate) {
-      el.approxState.title = '颜色数量过多，本次结果做了近似处理以保持操作流畅';
+      el.approxState.title = '颜色较多，已启用近似加速，个别颜色可能略有偏差';
     } else {
       el.approxState.removeAttribute('title');
     }
@@ -1807,15 +1819,17 @@ function updateOutputInfo() {
   el.resultColors.textContent = `${finalPalette.length} 色`;
   el.colorCount.textContent = String(finalPalette.length);
   if (cache.quantized) {
-    el.approxState.textContent = cache.quantized.approximate ? '近似' : '精确';
+    el.approxState.textContent = cache.quantized.approximate ? '近似加速' : '精确';
+    el.approxHint.hidden = !cache.quantized.approximate;
   } else {
     el.approxState.textContent = '精确';
+    el.approxHint.hidden = true;
   }
   el.paletteCount.textContent = `${finalPalette.length} 色`;
   if (finalPalette.length) {
     const changed = finalPalette.filter((entry) => entry.changed).length;
     if (cache.quantized?.approximate) {
-      el.paletteHint.textContent = '近似';
+      el.paletteHint.textContent = '近似加速';
     } else if (changed) {
       el.paletteHint.textContent = `已改色 ${changed}`;
     } else {
@@ -1943,6 +1957,7 @@ function syncAllControls() {
   updateModeUI();
   updateThresholdUI();
   el.targetColors.value = String(state.maxColors);
+  el.spatialToggle.checked = state.colorSpatial;
   el.ditherToggle.checked = state.dither;
   el.exportScale.value = String(state.exportScale);
   el.hoverHighlight.checked = state.hoverHighlight;
@@ -1981,6 +1996,9 @@ function updateModeUI() {
   const isTarget = state.colorMode === 'target';
   el.thresholdGroup.classList.toggle('is-hidden', isTarget);
   el.targetGroup.classList.toggle('is-hidden', !isTarget);
+  // 区域联动只作用于相近色合并模式；指定色数时保留开关状态但暂不可用。
+  el.spatialToggle.disabled = isTarget;
+  el.spatialToggle.closest('.check-line')?.classList.toggle('is-disabled', isTarget);
 }
 
 function updateThresholdUI() {
@@ -2114,6 +2132,7 @@ function makeProjectText() {
     threshold: state.threshold,
     maxColors: state.maxColors,
     dither: state.dither,
+    colorSpatial: state.colorSpatial,
     palette: cache.quantized.palette.map((entry) => entry.hex),
     recolorMap: { ...state.recolorMap },
     manualPalette: finalPalette.map((entry) => entry.hex),
@@ -2260,11 +2279,14 @@ function getDebugState() {
     threshold: state.threshold,
     maxColors: state.maxColors,
     dither: state.dither,
+    colorSpatial: state.colorSpatial,
     recolorMap: { ...state.recolorMap },
     resultZoom: state.resultZoom,
     hoverHighlight: state.hoverHighlight,
     colors: finalPalette.length,
     approximate: Boolean(cache.quantized?.approximate),
+    spatial: Boolean(cache.quantized?.spatial),
+    spatialMoved: cache.quantized?.spatialMoved ?? 0,
     timings: { ...lastTimings },
     palette: finalPalette.map((entry) => ({
       hex: entry.hex,
@@ -2292,6 +2314,13 @@ function exposeDebugApi() {
     setThreshold(value) {
       state.colorMode = 'threshold';
       state.threshold = clamp(Number(value) || 0, 0, 100);
+      syncAllControls();
+      markDirty();
+      rebuildPipeline();
+      return getDebugState();
+    },
+    setSpatial(value) {
+      state.colorSpatial = Boolean(value);
       syncAllControls();
       markDirty();
       rebuildPipeline();

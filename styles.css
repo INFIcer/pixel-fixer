@@ -508,6 +508,11 @@ button {
   font-family: var(--mono);
 }
 
+.check-line.is-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .range {
   --range-progress: 0%;
   appearance: none;

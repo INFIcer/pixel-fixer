@@ -136,6 +136,8 @@ export function normalizeProject(raw) {
     threshold: finiteNumber(raw.threshold, 0, 0, 100),
     maxColors: integer(raw.maxColors, 16, 1, 256),
     dither: Boolean(raw.dither),
+    // 区域联动：只有明确写入 false 才关闭；旧工程缺省视为开启。
+    colorSpatial: raw.colorSpatial !== false,
     palette: normalizePalette(raw.palette),
     recolorMap: normalizeRecolorMap(raw.recolorMap),
     manualPalette: normalizePalette(raw.manualPalette),
@@ -166,6 +168,7 @@ export function createProject(input, options = {}) {
     threshold: input?.threshold,
     maxColors: input?.maxColors,
     dither: input?.dither,
+    colorSpatial: input?.colorSpatial,
     palette: input?.palette,
     recolorMap: input?.recolorMap,
     manualPalette: input?.manualPalette,

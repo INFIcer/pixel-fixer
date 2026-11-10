@@ -117,18 +117,18 @@
             </div>
 
             <div class="segmented" role="group" aria-label="颜色模式">
-              <label><input type="radio" name="colorMode" value="threshold" checked><span>阈值合并</span></label>
-              <label><input type="radio" name="colorMode" value="target"><span>目标色数</span></label>
+              <label><input type="radio" name="colorMode" value="threshold" checked><span>相近色合并</span></label>
+              <label><input type="radio" name="colorMode" value="target"><span>指定色数</span></label>
             </div>
 
             <div id="thresholdGroup" class="mode-group">
               <div class="field-header">
-                <span>合并阈值</span>
+                <span>相近程度</span>
                 <output id="thresholdValue" class="value-chip" for="thresholdRange">0</output>
               </div>
               <input id="thresholdRange" class="range" type="range" min="0" max="100" step="1" value="0">
               <div class="range-scale"><span>0 · 不合并</span><span>100 · 合并最多</span></div>
-              <p class="hint hint-block">差异小于阈值的颜色会被合并。阈值越高，合并越多，最终颜色越少。</p>
+              <p class="hint hint-block">数值表示颜色差异的宽容程度：越大，越多颜色被视为相近并合并；0 表示保留原色。</p>
             </div>
 
             <div id="targetGroup" class="mode-group is-hidden">
@@ -140,6 +140,13 @@
             </div>
 
             <label class="check-line">
+              <input id="spatialToggle" type="checkbox" checked>
+              <span>区域联动</span>
+              <small>默认开启</small>
+            </label>
+            <p class="hint hint-block">把孤立的零散像素并入相邻主色，使同色区域更完整；只在相近色合并模式下生效。</p>
+
+            <label class="check-line">
               <input id="ditherToggle" type="checkbox">
               <span>Floyd–Steinberg 抖动</span>
               <small>默认关闭</small>
@@ -149,6 +156,7 @@
               <div><strong id="colorCount">0</strong><span>最终颜色</span></div>
               <div><strong id="approxState">精确</strong><span>颜色精度</span></div>
             </div>
+            <p class="hint hint-block" id="approxHint" hidden>颜色较多，已启用近似加速，个别颜色可能略有偏差。</p>
 
             <div class="inline-actions">
               <button type="button" id="btnUndoRecolor" class="btn btn-small" disabled>撤销改色</button>

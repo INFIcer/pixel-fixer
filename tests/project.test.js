@@ -126,6 +126,25 @@ test('UI 联动开关：缺省开启，显式 false 保持关闭', () => {
   assert.equal(parseProject(JSON.stringify(raw)).ui.hoverHighlight, true);
 });
 
+test('区域联动开关：缺省开启，显式 false 保持关闭', () => {
+  const project = example();
+  assert.equal(project.colorSpatial, true);
+
+  const raw = JSON.parse(serializeProject(project));
+  delete raw.colorSpatial;
+  assert.equal(parseProject(JSON.stringify(raw)).colorSpatial, true);
+
+  raw.colorSpatial = false;
+  assert.equal(parseProject(JSON.stringify(raw)).colorSpatial, false);
+
+  raw.colorSpatial = true;
+  assert.equal(parseProject(JSON.stringify(raw)).colorSpatial, true);
+
+  // 非布尔旧值按“未关闭”处理，避免工程编辑出错时意外关闭功能。
+  raw.colorSpatial = 'false';
+  assert.equal(parseProject(JSON.stringify(raw)).colorSpatial, true);
+});
+
 test('序列化 / 反序列化往返一致', () => {
   const project = example();
   const text = serializeProject(project);
