@@ -192,29 +192,6 @@
             </div>
             <p class="hint hint-block">导出时按最近邻放大，像素边缘保持锐利。需要保留工程请使用顶部“保存工程”。</p>
           </section>
-
-          <section class="control-section">
-            <div class="section-heading">
-              <div>
-                <span class="kicker">LINK</span>
-                <h2>联动高亮</h2>
-              </div>
-              <span class="section-index">05</span>
-            </div>
-
-            <label class="check-line">
-              <input id="hoverSwatchToPreview" type="checkbox" checked>
-              <span>悬浮色块时高亮对应像素</span>
-            </label>
-            <label class="check-line">
-              <input id="hoverPixelToPalette" type="checkbox" checked>
-              <span>悬浮像素时高亮对应色块</span>
-            </label>
-            <label class="check-line">
-              <input id="hoverPixelToPreview" type="checkbox" checked>
-              <span>悬浮像素时高亮同色区域</span>
-            </label>
-          </section>
         </div>
       </aside>
 
@@ -327,6 +304,24 @@
       </section>
 
       <aside class="panel palette-panel" aria-label="调色盘">
+        <section class="palette-link" aria-label="联动高亮">
+          <div class="palette-link-head">
+            <span class="kicker">LINK</span>
+            <h2>联动高亮</h2>
+          </div>
+          <label class="check-line">
+            <input id="hoverSwatchToPreview" type="checkbox" checked>
+            <span>悬浮色块时高亮对应像素</span>
+          </label>
+          <label class="check-line">
+            <input id="hoverPixelToPalette" type="checkbox" checked>
+            <span>悬浮像素时高亮对应色块</span>
+          </label>
+          <label class="check-line">
+            <input id="hoverPixelToPreview" type="checkbox" checked>
+            <span>悬浮像素时高亮同色区域</span>
+          </label>
+        </section>
         <div class="palette-head">
           <div>
             <span class="kicker">PALETTE</span>

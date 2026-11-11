@@ -102,7 +102,8 @@ button {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent 48%),
     #0b1118;
-  position: relative;
+  position: sticky;
+  top: 0;
   z-index: 20;
 }
 
@@ -1261,7 +1262,31 @@ select:disabled {
     #0e161f;
 }
 
+/* 右栏分两段：上段联动高亮开关，下段调色盘；调色盘网格占满剩余高度并单独滚动。 */
+.palette-link {
+  flex: 0 0 auto;
+  padding: 14px 15px 12px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(8, 13, 18, 0.25);
+}
+
+.palette-link-head {
+  margin-bottom: 2px;
+}
+
+.palette-link-head h2 {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+.palette-link .check-line {
+  margin-top: 8px;
+  font-size: 10.5px;
+}
+
 .palette-head {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1275,6 +1300,7 @@ select:disabled {
 }
 
 .palette-tools {
+  flex: 0 0 auto;
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 7px;
@@ -1282,6 +1308,7 @@ select:disabled {
 }
 
 .palette-legend {
+  flex: 0 0 auto;
   display: flex;
   justify-content: space-between;
   gap: 8px;
@@ -1300,7 +1327,7 @@ select:disabled {
 }
 
 .palette-list {
-  flex: 1;
+  flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -1414,7 +1441,8 @@ select:disabled {
 }
 
 .palette-empty {
-  flex: 1;
+  flex: 1 1 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
