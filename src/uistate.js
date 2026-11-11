@@ -602,3 +602,24 @@ export function zoomAroundPoint(input) {
     centerY - sourceHeight / 2,
   );
 }
+
+/**
+ * 悬浮联动的目标解析：三种高亮各自独立，关掉任一不影响另外两种。
+ * previewMaskIndex 是结果预览里要标出的调色板索引，paletteCardIndex 是
+ * 调色盘里要标出的色块索引；返回 -1 表示没有目标，调用方据此跳过绘制。
+ */
+export function resolveHoverTargets({
+  swatchToPreview = false,
+  pixelToPalette = false,
+  pixelToPreview = false,
+  swatchIndex = -1,
+  pixelIndex = -1,
+  paletteIndex = -1,
+} = {}) {
+  const hasPixelColor = pixelIndex >= 0 && paletteIndex >= 0;
+  const previewMaskIndex = swatchToPreview && swatchIndex >= 0
+    ? swatchIndex
+    : (pixelToPreview && hasPixelColor ? paletteIndex : -1);
+  const paletteCardIndex = pixelToPalette && hasPixelColor ? paletteIndex : -1;
+  return { previewMaskIndex, paletteCardIndex };
+}

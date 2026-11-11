@@ -116,6 +116,32 @@ export function resampleOutput(sourceImage, transform, method = 'nearest') {
 }
 
 /**
+ * 不透明阈值：alpha 低于 threshold 的像素按全透明处理。
+ * 必须在重采样之后、建立颜色模型/调色板映射之前调用，低 alpha 像素才不会
+ * 参与调色板统计，也不会在输出里留下半透明残影。
+ *
+ * @param {{data:Uint8ClampedArray|Uint8Array,width:number,height:number}} image
+ * @param {number} threshold 0~255；0 表示不处理，直接返回原图
+ * @returns {{data:Uint8ClampedArray|Uint8Array,width:number,height:number}}
+ */
+export function applyAlphaThreshold(image, threshold) {
+  const cut = Math.max(0, Math.min(255, Math.round(Number(threshold) || 0)));
+  if (cut <= 0) return image;
+
+  const { width, height, data } = image;
+  const out = new Uint8ClampedArray(data);
+  let changed = false;
+  for (let i = 0; i < width * height; i += 1) {
+    const offset = i * 4 + 3;
+    if (out[offset] > 0 && out[offset] < cut) {
+      out[offset] = 0;
+      changed = true;
+    }
+  }
+  return changed ? { width, height, data: out } : image;
+}
+
+/**
  * 规范化重映射表：键与值都是小写 #rrggbb，非法项丢弃。
  * @returns {Record<string,string>}
  */
@@ -154,7 +180,7 @@ export function resolvePalette(palette, recolorMap = {}) {
 
 /**
  * 将量化索引与最终调色板合成为 RGBA 输出。
- * 透明度沿用重采样结果的 alpha；透明像素保持透明。
+ * 透明度沿用重采样结果（不透明阈值已先行处理）的 alpha；透明像素保持透明。
  * @returns {{width:number,height:number,data:Uint8ClampedArray}}
  */
 export function composeOutput(resampled, quantized, finalPalette) {

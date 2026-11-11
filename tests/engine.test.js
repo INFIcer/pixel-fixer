@@ -9,6 +9,7 @@ import {
   convertLegacyScale,
   fitScale,
   resampleOutput,
+  applyAlphaThreshold,
   resolvePalette,
   composeOutput,
 } from '../src/engine.js';
@@ -172,6 +173,45 @@ test('输出合成保留透明度与改色后的像素值', () => {
   const quantized = { indices: new Uint32Array([TRANSPARENT_INDEX, 0]) };
   const out = composeOutput(resampled, quantized, [{ r: 10, g: 20, b: 30, hex: '#0a141e' }]);
   assert.deepEqual(Array.from(out.data), [0, 0, 0, 0, 10, 20, 30, 128]);
+});
+
+test('不透明阈值：低于阈值的 alpha 归零，达到阈值的保留', () => {
+  const image = makeImage(4, 1, (x) => [x * 10, 20, 30, [0, 100, 128, 200][x]]);
+  const out = applyAlphaThreshold(image, 128);
+  assert.notEqual(out, image);
+  assert.deepEqual(Array.from(out.data), [
+    0, 20, 30, 0,
+    10, 20, 30, 0,
+    20, 20, 30, 128,
+    30, 20, 30, 200,
+  ]);
+  // 原图不被修改。
+  assert.deepEqual(Array.from(image.data), [
+    0, 20, 30, 0,
+    10, 20, 30, 100,
+    20, 20, 30, 128,
+    30, 20, 30, 200,
+  ]);
+});
+
+test('不透明阈值：0 与不处理完全一致', () => {
+  const image = makeImage(2, 1, (x) => [x, 2, 3, [100, 200][x]]);
+  const out = applyAlphaThreshold(image, 0);
+  assert.equal(out, image);
+  assert.deepEqual(Array.from(out.data), Array.from(image.data));
+});
+
+test('不透明阈值在调色板映射前生效：低 alpha 像素不参与配色', () => {
+  const image = makeImage(2, 1, (x) => (x === 0 ? [10, 20, 30, 100] : [200, 100, 50, 200]));
+  const thresholded = applyAlphaThreshold(image, 128);
+  const quantized = quantize(thresholded, { mode: 'threshold', threshold: 0 });
+  assert.equal(quantized.colorCount, 1);
+  assert.equal(quantized.palette[0].hex, '#c86432');
+  assert.equal(quantized.transparentPixels, 1);
+  assert.equal(quantized.indices[0], TRANSPARENT_INDEX);
+
+  const composed = composeOutput(thresholded, quantized, resolvePalette(quantized.palette));
+  assert.deepEqual(Array.from(composed.data), [0, 0, 0, 0, 200, 100, 50, 200]);
 });
 
 test('端到端算法链路：裁剪→64×64→阈值合并→改色→工程往返', () => {

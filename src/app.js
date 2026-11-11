@@ -10,6 +10,7 @@ import {
   resampleOutput,
   resolvePalette,
   composeOutput,
+  applyAlphaThreshold,
   normalizeOutputSize,
   normalizeRecolorMap,
 } from './engine.js';
@@ -53,6 +54,7 @@ import {
   parseZoomInput,
   rangeProgress,
   resolveCropSizeEdit,
+  resolveHoverTargets,
   resolveSplitMode,
   restoreCropSizeSnapshot,
   resultZoomToSlider,
@@ -99,13 +101,17 @@ const state = {
   dither: false,
   // 区域联动：把孤立零散像素并入相邻主色；旧工程缺省为开。
   colorSpatial: true,
+  // 不透明阈值：alpha 低于该值的像素按全透明处理；0 表示不处理。
+  alphaThreshold: 0,
   recolorMap: {},
   resultZoom: 4,
   // 预览排列：side=左右，stack=上下；窗口过窄时显示上自动退化，不改写用户选择。
   splitMode: 'side',
   exportScale: 1,
-  // 调色盘联动：悬浮色块时是否在结果预览中高亮同色像素；旧工程缺省为开。
-  hoverHighlight: true,
+  // 悬浮联动：三种高亮各自独立，默认全开；旧工程由单一 hoverHighlight 迁移而来。
+  hoverSwatchToPreview: true,
+  hoverPixelToPalette: true,
+  hoverPixelToPreview: true,
   createdAt: null,
   updatedAt: null,
   dirty: false,
@@ -115,6 +121,9 @@ const cache = {
   geometryKey: null,
   resampled: null,
   crop: null,
+  // 应用不透明阈值后的重采样结果；颜色模型、量化与合成都以它为准。
+  thresholded: null,
+  pixelKey: null,
   model: null,
   quantKey: null,
   quantized: null,
@@ -153,6 +162,7 @@ let appliedSplitMode = 'side';
 
 // 调色盘联动的当前状态。pixelIndex 是“结果预览”里当前悬停的输出像素；
 // swatchIndex 是鼠标悬停的调色盘色块。两者不会同时存在（鼠标只能在一个区域）。
+// mask 缓存当前高亮索引的掩码，索引可能来自色块，也可能来自悬停像素的颜色。
 const hoverLink = {
   pendingPoint: null,
   frameQueued: false,
@@ -249,6 +259,8 @@ function invalidateAll() {
   cache.geometryKey = null;
   cache.resampled = null;
   cache.crop = null;
+  cache.thresholded = null;
+  cache.pixelKey = null;
   cache.model = null;
   cache.quantKey = null;
   cache.quantized = null;
@@ -282,6 +294,7 @@ function captureEditSnapshot() {
     maxColors: state.maxColors,
     dither: state.dither,
     colorSpatial: state.colorSpatial,
+    alphaThreshold: state.alphaThreshold,
     recolorMap: { ...state.recolorMap },
   };
 }
@@ -307,6 +320,7 @@ function editSnapshotKey(snapshot) {
     snapshot.maxColors,
     snapshot.dither ? 1 : 0,
     snapshot.colorSpatial ? 1 : 0,
+    snapshot.alphaThreshold,
     recolor,
   ].join('|');
 }
@@ -361,6 +375,7 @@ function applyEditSnapshot(snapshot) {
   state.maxColors = snapshot.maxColors;
   state.dither = Boolean(snapshot.dither);
   state.colorSpatial = Boolean(snapshot.colorSpatial);
+  state.alphaThreshold = snapshot.alphaThreshold;
   state.recolorMap = { ...snapshot.recolorMap };
 
   markDirty();
@@ -428,7 +443,7 @@ function cacheElements() {
     'btnZoomOut', 'btnZoomIn', 'btnZoomFit', 'btnZoomActual',
     'btnResetCrop', 'resampleSelect', 'resampleDesc', 'thresholdGroup',
     'targetGroup', 'thresholdRange', 'thresholdValue', 'targetColors',
-    'spatialToggle', 'ditherToggle', 'colorCount', 'approxState', 'approxHint',
+    'spatialToggle', 'ditherToggle', 'alphaThresholdRange', 'alphaThresholdValue', 'colorCount', 'approxState', 'approxHint',
     'btnResetRecolor', 'exportScale', 'exportFilename', 'exportStats',
     'btnExportPng', 'btnExportPalette', 'sourceWrap', 'sourceCanvas',
     'sourceEmpty', 'btnEmptyImport', 'btnEmptyProject', 'srcInfoBadge',
@@ -438,7 +453,7 @@ function cacheElements() {
     'btnResultZoomOut', 'btnResultZoomIn', 'resultZoomInput', 'resultZoomRange',
     'btnResultZoomFit', 'splitGroup', 'splitHint',
     'btnImportHex', 'btnExportHex', 'paletteHint', 'paletteList',
-    'paletteEmpty', 'hoverHighlight', 'pixelTooltip', 'fileImage',
+    'paletteEmpty', 'hoverSwatchToPreview', 'hoverPixelToPalette', 'hoverPixelToPreview', 'pixelTooltip', 'fileImage',
     'fileProject', 'fileHex', 'colorPicker',
     'statusText', 'timingText', 'projectState', 'dropOverlay', 'toast',
   ];
@@ -658,6 +673,19 @@ function bindEvents() {
     });
   });
 
+  el.alphaThresholdRange.addEventListener('input', () => {
+    recordEdit(
+      '不透明阈值',
+      () => {
+        state.alphaThreshold = clamp(Math.round(Number(el.alphaThresholdRange.value) || 0), 0, 255);
+        updateAlphaThresholdUI();
+        markDirty();
+        scheduleRebuild(false);
+      },
+      { coalesceKey: 'alpha-threshold', windowMs: 400 },
+    );
+  });
+
   el.exportScale.addEventListener('change', () => {
     state.exportScale = Number(el.exportScale.value) || 1;
     updateExportMeta();
@@ -705,7 +733,9 @@ function bindEvents() {
   el.resultScroll.addEventListener('scroll', onResultScroll, { passive: true });
   el.paletteList.addEventListener('pointermove', onPalettePointerMove);
   el.paletteList.addEventListener('pointerleave', onPalettePointerLeave);
-  el.hoverHighlight.addEventListener('change', onHoverHighlightChange);
+  el.hoverSwatchToPreview.addEventListener('change', () => onHoverSettingChange('hoverSwatchToPreview'));
+  el.hoverPixelToPalette.addEventListener('change', () => onHoverSettingChange('hoverPixelToPalette'));
+  el.hoverPixelToPreview.addEventListener('change', () => onHoverSettingChange('hoverPixelToPreview'));
 
   el.paletteList.addEventListener('click', (event) => {
     const card = event.target.closest('.swatch-card');
@@ -1016,10 +1046,13 @@ function resetWorkspaceForSource() {
   state.maxColors = 16;
   state.dither = false;
   state.colorSpatial = true;
+  state.alphaThreshold = 0;
   state.recolorMap = {};
   state.resultZoom = 4;
   state.exportScale = 1;
-  state.hoverHighlight = true;
+  state.hoverSwatchToPreview = true;
+  state.hoverPixelToPalette = true;
+  state.hoverPixelToPreview = true;
   state.createdAt = new Date().toISOString();
   state.updatedAt = null;
   state.dirty = true;
@@ -1094,11 +1127,14 @@ async function loadProjectText(text, options = {}) {
   state.maxColors = project.maxColors;
   state.dither = project.dither;
   state.colorSpatial = project.colorSpatial;
+  state.alphaThreshold = project.ui.alphaThreshold;
   state.recolorMap = normalizeRecolorMap(project.recolorMap);
   state.resultZoom = project.ui.resultZoom;
   state.splitMode = project.ui.splitMode;
   state.exportScale = project.ui.exportScale;
-  state.hoverHighlight = project.ui.hoverHighlight;
+  state.hoverSwatchToPreview = project.ui.hoverSwatchToPreview;
+  state.hoverPixelToPalette = project.ui.hoverPixelToPalette;
+  state.hoverPixelToPreview = project.ui.hoverPixelToPreview;
   state.createdAt = project.createdAt;
   state.updatedAt = project.updatedAt;
   state.dirty = false;
@@ -1493,6 +1529,7 @@ function quantSignature(geometryKey) {
     state.maxColors,
     state.dither ? 1 : 0,
     state.colorSpatial ? 1 : 0,
+    state.alphaThreshold,
   ].join('|');
 }
 
@@ -1538,8 +1575,10 @@ function rebuildPipeline() {
       crop = result.crop;
       cache.resampled = resampled;
       cache.crop = crop;
-      cache.model = createColorModel(resampled);
       cache.geometryKey = geometryKey;
+      cache.pixelKey = null;
+      cache.thresholded = null;
+      cache.model = null;
       cache.quantKey = null;
       cache.quantized = null;
       resampleTime = performance.now() - start;
@@ -1548,10 +1587,24 @@ function rebuildPipeline() {
       crop = cache.crop;
     }
 
+    // 不透明阈值只改 alpha，不必重新采样；阈值变化时重建颜色模型，
+    // 让低于阈值的像素从一开始就不参与调色板统计。
+    const pixelKey = `${geometryKey}|${state.alphaThreshold}`;
+    if (pixelKey !== cache.pixelKey || !cache.thresholded) {
+      const start = performance.now();
+      cache.thresholded = applyAlphaThreshold(resampled, state.alphaThreshold);
+      cache.model = createColorModel(cache.thresholded);
+      cache.pixelKey = pixelKey;
+      cache.quantKey = null;
+      cache.quantized = null;
+      resampleTime += performance.now() - start;
+    }
+    const pixels = cache.thresholded;
+
     const qKey = quantSignature(geometryKey);
     if (qKey !== cache.quantKey || !cache.quantized) {
       const start = performance.now();
-      cache.quantized = quantize(resampled, {
+      cache.quantized = quantize(pixels, {
         mode: state.colorMode,
         threshold: state.threshold,
         maxColors: state.maxColors,
@@ -1566,7 +1619,7 @@ function rebuildPipeline() {
     const composeStart = performance.now();
     finalPalette.length = 0;
     finalPalette.push(...resolvePalette(cache.quantized.palette, state.recolorMap));
-    const composed = composeOutput(resampled, cache.quantized, finalPalette);
+    const composed = composeOutput(pixels, cache.quantized, finalPalette);
     outputImageData = composed;
     ensureOutputCanvas(composed.width, composed.height);
     const context = outputCanvas.getContext('2d');
@@ -1633,7 +1686,7 @@ function drawResultScaled() {
   context.imageSmoothingEnabled = false;
   context.clearRect(0, 0, width, height);
   context.drawImage(outputCanvas, 0, 0, width, height);
-  paintSwatchHighlight(context);
+  paintHoverHighlight(context);
   el.resultTip.textContent = `${formatResultZoom(zoom)} 最近邻放大 · 实际 ${outputCanvas.width}×${outputCanvas.height}`;
   syncResultZoomControls();
 }
@@ -1781,12 +1834,15 @@ function resetPaletteLink() {
 }
 
 function clearPixelHover() {
+  // 预览像素 → 预览同色区域的高亮需要重画一次才能擦掉掩码。
+  const hadMask = state.hoverPixelToPreview && hoverLink.pixelIndex >= 0 && hoverLink.mask !== null;
   removePixelCard(hoverLink.paletteIndex);
   hoverLink.pixelIndex = -1;
   hoverLink.pixelX = -1;
   hoverLink.pixelY = -1;
   hoverLink.pixelHex = null;
   hoverLink.paletteIndex = -1;
+  hoverLink.mask = null;
   if (el.pixelTooltip) {
     el.pixelTooltip.hidden = true;
     el.pixelTooltip.textContent = '';
@@ -1795,14 +1851,24 @@ function clearPixelHover() {
     el.pixelInfo.textContent = '当前像素：—';
     el.pixelInfo.classList.remove('has-pixel');
   }
+  if (hadMask) drawResultScaled();
+}
+
+/** 取消像素 → 预览的高亮；repaint 为 true 时立即重画结果预览。 */
+function clearPixelHighlight(repaint = false) {
+  const active = hoverLink.pixelIndex >= 0 && hoverLink.mask !== null;
+  hoverLink.mask = null;
+  if (active && repaint) drawResultScaled();
 }
 
 /** 取消色块 → 预览的高亮；repaint 为 true 时立即重画结果预览。 */
 function clearSwatchHighlight(repaint = false) {
   const active = hoverLink.swatchIndex >= 0;
   hoverLink.swatchIndex = -1;
-  hoverLink.mask = null;
-  if (active && repaint) drawResultScaled();
+  if (active) {
+    hoverLink.mask = null;
+    if (repaint) drawResultScaled();
+  }
 }
 
 function onResultPointerMove(event) {
@@ -1851,29 +1917,48 @@ function flushResultHover() {
 }
 
 function applyPixelHover(hit, color, paletteIndex, point) {
-  removePixelCard(hoverLink.paletteIndex);
+  const previousPaletteIndex = hoverLink.paletteIndex;
+  removePixelCard(previousPaletteIndex);
   hoverLink.pixelIndex = hit.index;
   hoverLink.pixelX = hit.x;
   hoverLink.pixelY = hit.y;
   hoverLink.pixelHex = color.hex;
   hoverLink.paletteIndex = paletteIndex;
 
-  const card = paletteCardAt(paletteIndex);
-  if (card) {
-    card.classList.add('is-pixel-active');
-    revealPaletteCard(card);
+  const targets = resolveHoverTargets({
+    swatchToPreview: state.hoverSwatchToPreview,
+    pixelToPalette: state.hoverPixelToPalette,
+    pixelToPreview: state.hoverPixelToPreview,
+    swatchIndex: hoverLink.swatchIndex,
+    pixelIndex: hit.index,
+    paletteIndex,
+  });
+
+  if (targets.paletteCardIndex >= 0) {
+    const card = paletteCardAt(targets.paletteCardIndex);
+    if (card) {
+      card.classList.add('is-pixel-active');
+      revealPaletteCard(card);
+    }
   }
 
   el.pixelInfo.textContent = formatPixelInfo(hit.x, hit.y, color.hex);
   el.pixelInfo.classList.add('has-pixel');
 
-  if (!el.pixelTooltip) return;
-  const stats = paletteStats(finalPalette, paletteIndex);
-  el.pixelTooltip.textContent = stats?.hex
-    ? formatPixelSummary(stats.hex, stats.ratio, stats.count)
-    : color.hex.toUpperCase();
-  el.pixelTooltip.hidden = false;
-  positionPixelTooltip(point.x, point.y);
+  if (el.pixelTooltip) {
+    const stats = paletteStats(finalPalette, paletteIndex);
+    el.pixelTooltip.textContent = stats?.hex
+      ? formatPixelSummary(stats.hex, stats.ratio, stats.count)
+      : color.hex.toUpperCase();
+    el.pixelTooltip.hidden = false;
+    positionPixelTooltip(point.x, point.y);
+  }
+
+  // 同色区域高亮只在悬停到另一种颜色时重画；同一颜色内移动不重复计算掩码。
+  if (targets.previewMaskIndex === paletteIndex && paletteIndex !== previousPaletteIndex) {
+    hoverLink.mask = null;
+    drawResultScaled();
+  }
 }
 
 function onResultPointerLeave() {
@@ -1924,7 +2009,7 @@ function onPalettePointerMove(event) {
   }
   const index = Number(card.dataset.index);
   if (!Number.isInteger(index) || index === hoverLink.swatchIndex) return;
-  if (!state.hoverHighlight || !outputImageData || !cache.quantized) {
+  if (!state.hoverSwatchToPreview || !outputImageData || !cache.quantized) {
     clearSwatchHighlight(true);
     return;
   }
@@ -1937,16 +2022,53 @@ function onPalettePointerLeave() {
   clearSwatchHighlight(true);
 }
 
-function onHoverHighlightChange() {
-  state.hoverHighlight = Boolean(el.hoverHighlight.checked);
-  if (!state.hoverHighlight) clearSwatchHighlight(true);
+const HOVER_SETTING_KEYS = ['hoverSwatchToPreview', 'hoverPixelToPalette', 'hoverPixelToPreview'];
+
+/** 关闭某项时立即撤掉它已经画出的高亮，避免残留。 */
+function setHoverSetting(key, enabled) {
+  state[key] = Boolean(enabled);
+  if (!state[key]) {
+    if (key === 'hoverSwatchToPreview') clearSwatchHighlight(true);
+    else if (key === 'hoverPixelToPalette') removePixelCard(hoverLink.paletteIndex);
+    else if (key === 'hoverPixelToPreview') clearPixelHighlight(true);
+    return;
+  }
+  // 打开时若指针正停在画面上，立即补上对应高亮，不必等下一次移动。
+  if (key === 'hoverPixelToPalette' && hoverLink.pixelIndex >= 0) {
+    const card = paletteCardAt(hoverLink.paletteIndex);
+    if (card) {
+      card.classList.add('is-pixel-active');
+      revealPaletteCard(card);
+    }
+  } else if (key === 'hoverPixelToPreview' && hoverLink.pixelIndex >= 0 && hoverLink.paletteIndex >= 0) {
+    hoverLink.mask = null;
+    drawResultScaled();
+  }
+}
+
+function onHoverSettingChange(key) {
+  setHoverSetting(key, el[key].checked);
+}
+
+/**
+ * 当前该高亮哪个调色板索引：调色盘悬浮优先，其次是结果预览悬浮的像素颜色。
+ * 返回 -1 表示没有需要高亮的目标；对应开关关闭时也不会产生掩码计算。
+ */
+function activeHighlightIndex() {
+  return resolveHoverTargets({
+    swatchToPreview: state.hoverSwatchToPreview,
+    pixelToPreview: state.hoverPixelToPreview,
+    swatchIndex: hoverLink.swatchIndex,
+    pixelIndex: hoverLink.pixelIndex,
+    paletteIndex: hoverLink.paletteIndex,
+  }).previewMaskIndex;
 }
 
 /**
  * 为某个调色板索引预生成掩码 canvas（输出分辨率）与边界路径（显示分辨率）。
- * 大结果只保留掩码，不逐像素描边；两种方式都只在悬停色块变化时计算一次。
+ * 大结果只保留掩码，不逐像素描边；只在悬停目标变化时计算一次。
  */
-function buildSwatchHighlight(index, width, height, zoom) {
+function buildHoverHighlightMask(index, width, height, zoom) {
   const cached = hoverLink.mask;
   if (cached
     && cached.index === index
@@ -2016,13 +2138,14 @@ function buildSwatchHighlight(index, width, height, zoom) {
   return hoverLink.mask;
 }
 
-function paintSwatchHighlight(context) {
-  if (!state.hoverHighlight || hoverLink.swatchIndex < 0) return;
+function paintHoverHighlight(context) {
+  const index = activeHighlightIndex();
+  if (index < 0) return;
   if (!outputImageData || !cache.quantized) return;
 
   const width = outputImageData.width;
   const height = outputImageData.height;
-  const mask = buildSwatchHighlight(hoverLink.swatchIndex, width, height, state.resultZoom);
+  const mask = buildHoverHighlightMask(index, width, height, state.resultZoom);
   if (!mask) return;
 
   context.save();
@@ -2048,13 +2171,13 @@ function scheduleRecolorRefresh() {
 }
 
 function refreshRecolorOnly() {
-  if (!cache.quantized || !cache.resampled) return;
+  if (!cache.quantized || !cache.thresholded) return;
   // 改色会改变颜色与色块内容，旧的像素定位/色块高亮不再可信。
   resetPaletteLink();
   const start = performance.now();
   finalPalette.length = 0;
   finalPalette.push(...resolvePalette(cache.quantized.palette, state.recolorMap));
-  const composed = composeOutput(cache.resampled, cache.quantized, finalPalette);
+  const composed = composeOutput(cache.thresholded, cache.quantized, finalPalette);
   outputImageData = composed;
   ensureOutputCanvas(composed.width, composed.height);
   const context = outputCanvas.getContext('2d');
@@ -2317,8 +2440,11 @@ function syncAllControls() {
   el.targetColors.value = String(state.maxColors);
   el.spatialToggle.checked = state.colorSpatial;
   el.ditherToggle.checked = state.dither;
+  updateAlphaThresholdUI();
   el.exportScale.value = String(state.exportScale);
-  el.hoverHighlight.checked = state.hoverHighlight;
+  el.hoverSwatchToPreview.checked = state.hoverSwatchToPreview;
+  el.hoverPixelToPalette.checked = state.hoverPixelToPalette;
+  el.hoverPixelToPreview.checked = state.hoverPixelToPreview;
   syncResultZoomControls();
   updateExportMeta();
   updateActionAvailability();
@@ -2363,6 +2489,12 @@ function updateThresholdUI() {
   el.thresholdRange.value = String(state.threshold);
   el.thresholdValue.textContent = String(Math.round(state.threshold));
   timelineValue(el.thresholdRange, state.threshold);
+}
+
+function updateAlphaThresholdUI() {
+  el.alphaThresholdRange.value = String(state.alphaThreshold);
+  el.alphaThresholdValue.textContent = String(Math.round(state.alphaThreshold));
+  timelineValue(el.alphaThresholdRange, state.alphaThreshold);
 }
 
 function syncResultZoomControls() {
@@ -2512,7 +2644,10 @@ function makeProjectText() {
       // 源图缩放百分比：恢复时优先使用，旧工程缺省时由 transform.scale 推导。
       sourceZoom: Math.round(zoomPercent(state.transform.scale) * 100) / 100,
       splitMode: state.splitMode,
-      hoverHighlight: state.hoverHighlight,
+      alphaThreshold: state.alphaThreshold,
+      hoverSwatchToPreview: state.hoverSwatchToPreview,
+      hoverPixelToPalette: state.hoverPixelToPalette,
+      hoverPixelToPreview: state.hoverPixelToPreview,
     },
   }, {
     createdAt: state.createdAt,
@@ -2656,11 +2791,15 @@ function getDebugState() {
     maxColors: state.maxColors,
     dither: state.dither,
     colorSpatial: state.colorSpatial,
+    alphaThreshold: state.alphaThreshold,
     recolorMap: { ...state.recolorMap },
     resultZoom: state.resultZoom,
     splitMode: state.splitMode,
     effectiveSplitMode: appliedSplitMode,
-    hoverHighlight: state.hoverHighlight,
+    hoverSwatchToPreview: state.hoverSwatchToPreview,
+    hoverPixelToPalette: state.hoverPixelToPalette,
+    hoverPixelToPreview: state.hoverPixelToPreview,
+    highlightIndex: activeHighlightIndex(),
     colors: finalPalette.length,
     approximate: Boolean(cache.quantized?.approximate),
     spatial: Boolean(cache.quantized?.spatial),
@@ -2770,7 +2909,9 @@ function exposeDebugApi() {
     getTimings: () => ({ ...lastTimings }),
     getHoverState() {
       return {
-        hoverHighlight: state.hoverHighlight,
+        hoverSwatchToPreview: state.hoverSwatchToPreview,
+        hoverPixelToPalette: state.hoverPixelToPalette,
+        hoverPixelToPreview: state.hoverPixelToPreview,
         pixel: hoverLink.pixelIndex >= 0
           ? {
             index: hoverLink.pixelIndex,
@@ -2781,14 +2922,25 @@ function exposeDebugApi() {
           }
           : null,
         swatchIndex: hoverLink.swatchIndex,
+        highlightIndex: activeHighlightIndex(),
+        maskIndex: hoverLink.mask ? hoverLink.mask.index : null,
         pixelCardActive: Boolean(el.paletteList.querySelector('.swatch-card.is-pixel-active')),
         tooltip: el.pixelTooltip && !el.pixelTooltip.hidden ? el.pixelTooltip.textContent : null,
       };
     },
-    setHoverHighlight(value) {
-      state.hoverHighlight = Boolean(value);
-      el.hoverHighlight.checked = state.hoverHighlight;
-      if (!state.hoverHighlight) clearSwatchHighlight(true);
+    setHoverSettings(partial = {}) {
+      for (const key of HOVER_SETTING_KEYS) {
+        if (!(key in partial)) continue;
+        setHoverSetting(key, partial[key]);
+        el[key].checked = state[key];
+      }
+      return getDebugState();
+    },
+    setAlphaThreshold(value) {
+      state.alphaThreshold = clamp(Math.round(Number(value) || 0), 0, 255);
+      syncAllControls();
+      markDirty();
+      rebuildPipeline();
       return getDebugState();
     },
     getResultDataUrl(factor = 1) {

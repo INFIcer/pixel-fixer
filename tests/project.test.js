@@ -32,7 +32,7 @@ function example() {
     palette: ['#FF0000', '#00ff00'],
     recolorMap: { '#FF0000': '#112233' },
     manualPalette: ['#112233', '#00FF00'],
-    ui: { resultZoom: 8, lockAspect: true, exportScale: 8 },
+    ui: { resultZoom: 8, lockAspect: true, exportScale: 8, alphaThreshold: 96 },
   }, {
     now: new Date('2026-01-02T03:04:05.000Z'),
     createdAt: '2025-12-31T00:00:00.000Z',
@@ -123,23 +123,75 @@ test('缩放口径：新工程写 pixel，旧工程缺省按 fit 识别', () => 
   assert.equal(parsed.transform.scale, 1.75);
 });
 
-test('UI 联动开关：缺省开启，显式 false 保持关闭', () => {
+test('不透明阈值：默认 0，越界与非法值被夹到 0~255，往返保留', () => {
   const project = example();
-  assert.equal(project.ui.hoverHighlight, true);
+  assert.equal(project.ui.alphaThreshold, 96);
 
   const raw = JSON.parse(serializeProject(project));
+  delete raw.ui.alphaThreshold;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.alphaThreshold, 0);
+
+  raw.ui.alphaThreshold = 500;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.alphaThreshold, 255);
+  raw.ui.alphaThreshold = -20;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.alphaThreshold, 0);
+  raw.ui.alphaThreshold = 'abc';
+  assert.equal(parseProject(JSON.stringify(raw)).ui.alphaThreshold, 0);
+  raw.ui.alphaThreshold = 127.6;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.alphaThreshold, 128);
+  raw.ui.alphaThreshold = 200;
+  assert.equal(parseProject(JSON.stringify(raw)).ui.alphaThreshold, 200);
+});
+
+test('悬浮联动开关：旧工程按 hoverHighlight 迁移，新字段各自独立', () => {
+  const project = example();
+  assert.deepEqual(
+    {
+      swatch: project.ui.hoverSwatchToPreview,
+      palette: project.ui.hoverPixelToPalette,
+      preview: project.ui.hoverPixelToPreview,
+    },
+    { swatch: true, palette: true, preview: true },
+  );
+
+  const raw = JSON.parse(serializeProject(project));
+  delete raw.ui.hoverSwatchToPreview;
+  delete raw.ui.hoverPixelToPalette;
+  delete raw.ui.hoverPixelToPreview;
+
+  // 旧工程缺省视为开启。
   delete raw.ui.hoverHighlight;
-  assert.equal(parseProject(JSON.stringify(raw)).ui.hoverHighlight, true);
+  let parsed = parseProject(JSON.stringify(raw));
+  assert.deepEqual(
+    [parsed.ui.hoverSwatchToPreview, parsed.ui.hoverPixelToPalette, parsed.ui.hoverPixelToPreview],
+    [true, true, true],
+  );
 
+  // 旧工程显式关闭：三个都关闭。
   raw.ui.hoverHighlight = false;
-  assert.equal(parseProject(JSON.stringify(raw)).ui.hoverHighlight, false);
+  parsed = parseProject(JSON.stringify(raw));
+  assert.deepEqual(
+    [parsed.ui.hoverSwatchToPreview, parsed.ui.hoverPixelToPalette, parsed.ui.hoverPixelToPreview],
+    [false, false, false],
+  );
 
+  // 旧工程显式开启 / 非布尔旧值：三个都开启，避免编辑出错时意外关闭。
   raw.ui.hoverHighlight = true;
-  assert.equal(parseProject(JSON.stringify(raw)).ui.hoverHighlight, true);
-
-  // 非布尔旧值按“未关闭”处理，避免工程编辑出错时意外关闭功能。
+  parsed = parseProject(JSON.stringify(raw));
+  assert.deepEqual(
+    [parsed.ui.hoverSwatchToPreview, parsed.ui.hoverPixelToPalette, parsed.ui.hoverPixelToPreview],
+    [true, true, true],
+  );
   raw.ui.hoverHighlight = 'false';
-  assert.equal(parseProject(JSON.stringify(raw)).ui.hoverHighlight, true);
+  assert.equal(parseProject(JSON.stringify(raw)).ui.hoverSwatchToPreview, true);
+
+  // 新字段优先于旧开关，且三者互不影响。
+  raw.ui.hoverHighlight = false;
+  raw.ui.hoverPixelToPalette = true;
+  parsed = parseProject(JSON.stringify(raw));
+  assert.equal(parsed.ui.hoverSwatchToPreview, false);
+  assert.equal(parsed.ui.hoverPixelToPalette, true);
+  assert.equal(parsed.ui.hoverPixelToPreview, false);
 });
 
 test('区域联动开关：缺省开启，显式 false 保持关闭', () => {

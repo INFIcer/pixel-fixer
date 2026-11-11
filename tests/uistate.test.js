@@ -24,6 +24,7 @@ import {
   percentToSlider,
   rangeProgress,
   resolveCropSizeEdit,
+  resolveHoverTargets,
   resolveSplitMode,
   restoreCropSizeSnapshot,
   resultZoomFromPercent,
@@ -409,6 +410,45 @@ test('结果预览缩放：对数滑块与适应窗口', () => {
   assert.ok(Math.abs(fitResultZoom(512, 512, 800, 600) - 536 / 512) < 1e-9);
   assert.equal(fitResultZoom(0, 64, 800, 600), 1);
   assert.equal(fitResultZoom(64, 64, 20, 20), 1);
+});
+
+test('悬浮联动：三种高亮的目标互不影响', () => {
+  const base = {
+    swatchToPreview: true,
+    pixelToPalette: true,
+    pixelToPreview: true,
+    swatchIndex: -1,
+    pixelIndex: 7,
+    paletteIndex: 2,
+  };
+  assert.deepEqual(resolveHoverTargets(base), { previewMaskIndex: 2, paletteCardIndex: 2 });
+
+  // 关掉像素 → 色块，不影响另外两种。
+  assert.deepEqual(
+    resolveHoverTargets({ ...base, pixelToPalette: false }),
+    { previewMaskIndex: 2, paletteCardIndex: -1 },
+  );
+  // 关掉像素 → 预览，不影响另外两种。
+  assert.deepEqual(
+    resolveHoverTargets({ ...base, pixelToPreview: false }),
+    { previewMaskIndex: -1, paletteCardIndex: 2 },
+  );
+  // 关掉色块 → 预览，像素 → 预览仍生效。
+  assert.deepEqual(
+    resolveHoverTargets({ ...base, swatchToPreview: false, swatchIndex: 4 }),
+    { previewMaskIndex: 2, paletteCardIndex: 2 },
+  );
+  // 色块悬浮优先；像素不在预览里时只由色块开关决定。
+  assert.deepEqual(
+    resolveHoverTargets({ ...base, swatchIndex: 4, pixelIndex: -1 }),
+    { previewMaskIndex: 4, paletteCardIndex: -1 },
+  );
+  // 全关或无目标时不产生任何高亮。
+  assert.deepEqual(
+    resolveHoverTargets({ ...base, swatchToPreview: false, pixelToPalette: false, pixelToPreview: false }),
+    { previewMaskIndex: -1, paletteCardIndex: -1 },
+  );
+  assert.deepEqual(resolveHoverTargets(), { previewMaskIndex: -1, paletteCardIndex: -1 });
 });
 
 test('分割模式：宽度不足时左右退化为上下', () => {

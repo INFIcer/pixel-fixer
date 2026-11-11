@@ -144,6 +144,14 @@
               <small>默认关闭</small>
             </label>
 
+            <div class="field-header">
+              <span>不透明阈值</span>
+              <output id="alphaThresholdValue" class="value-chip" for="alphaThresholdRange">0</output>
+            </div>
+            <input id="alphaThresholdRange" class="range" type="range" min="0" max="255" step="1" value="0">
+            <div class="range-scale"><span>0 · 保持原样</span><span>255 · 只留不透明</span></div>
+            <p class="hint hint-block">不透明度低于该值的像素按完全透明处理；0 表示保持原样。</p>
+
             <div class="mini-stats">
               <div><strong id="colorCount">0</strong><span>最终颜色</span></div>
               <div><strong id="approxState">精确</strong><span>颜色精度</span></div>
@@ -183,6 +191,29 @@
               <button type="button" id="btnExportPalette" class="btn">调色盘 PNG</button>
             </div>
             <p class="hint hint-block">导出时按最近邻放大，像素边缘保持锐利。需要保留工程请使用顶部“保存工程”。</p>
+          </section>
+
+          <section class="control-section">
+            <div class="section-heading">
+              <div>
+                <span class="kicker">LINK</span>
+                <h2>联动高亮</h2>
+              </div>
+              <span class="section-index">05</span>
+            </div>
+
+            <label class="check-line">
+              <input id="hoverSwatchToPreview" type="checkbox" checked>
+              <span>悬浮色块时高亮对应像素</span>
+            </label>
+            <label class="check-line">
+              <input id="hoverPixelToPalette" type="checkbox" checked>
+              <span>悬浮像素时高亮对应色块</span>
+            </label>
+            <label class="check-line">
+              <input id="hoverPixelToPreview" type="checkbox" checked>
+              <span>悬浮像素时高亮同色区域</span>
+            </label>
           </section>
         </div>
       </aside>
@@ -306,13 +337,6 @@
         <div class="palette-tools">
           <button type="button" id="btnImportHex" class="btn btn-small">导入 HEX</button>
           <button type="button" id="btnExportHex" class="btn btn-small">导出 HEX</button>
-        </div>
-        <div class="palette-hover">
-          <label class="check-line palette-hover-toggle" title="悬浮色块时，在预览中标出该颜色的像素。">
-            <input id="hoverHighlight" type="checkbox" checked>
-            <span>悬停色块时高亮像素</span>
-          </label>
-          <p class="hint palette-hover-hint">悬浮色块时，在预览中标出该颜色的像素。</p>
         </div>
         <div class="palette-legend">
           <span>点击色块改色 · 改动应用到整张图</span>

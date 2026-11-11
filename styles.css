@@ -1281,29 +1281,6 @@ select:disabled {
   padding: 0 15px 11px;
 }
 
-.palette-hover {
-  padding: 0 15px 10px;
-}
-
-.palette-hover .check-line {
-  margin-top: 0;
-  gap: 7px;
-  font-size: 10.5px;
-}
-
-.palette-hover .check-line input {
-  flex: none;
-  width: 14px;
-  height: 14px;
-}
-
-.palette-hover-hint {
-  margin-top: 4px;
-  padding-left: 21px;
-  font-size: 9.5px;
-  line-height: 1.45;
-}
-
 .palette-legend {
   display: flex;
   justify-content: space-between;

@@ -74,6 +74,9 @@ function normalizeUi(value, fallbackScale = 1) {
   const ui = value && typeof value === 'object' ? value : {};
   const zoom = Number(ui.resultZoom);
   const exportScale = Number(ui.exportScale);
+  // 旧的单一联动开关：只有明确写入 false 才关闭；缺省或非布尔值视为开启。
+  const legacyHover = ui.hoverHighlight !== false;
+  const hoverFlag = (key) => (typeof ui[key] === 'boolean' ? ui[key] : legacyHover);
   return {
     // 结果预览倍率：0.25~8 连续，旧工程的 1/4/8 档位照常兼容。
     resultZoom: clampResultZoom(Number.isFinite(zoom) ? zoom : 4),
@@ -82,8 +85,12 @@ function normalizeUi(value, fallbackScale = 1) {
     exportScale: [1, 2, 4, 8, 16].includes(exportScale) ? exportScale : 1,
     // 源图缩放百分比（1~6400）：与 transform.scale 对应，便于阅读与恢复。
     sourceZoom: zoomPercentValue(ui.sourceZoom, fallbackScale),
-    // 调色盘联动开关：只有明确写入 false 才关闭；旧工程缺省视为开启。
-    hoverHighlight: ui.hoverHighlight !== false,
+    // 不透明阈值：低于该 alpha 的像素按全透明处理；0 表示保持原样。
+    alphaThreshold: integer(ui.alphaThreshold, 0, 0, 255),
+    // 三种悬浮高亮互相独立；旧工程只有一个 hoverHighlight，按它统一迁移。
+    hoverSwatchToPreview: hoverFlag('hoverSwatchToPreview'),
+    hoverPixelToPalette: hoverFlag('hoverPixelToPalette'),
+    hoverPixelToPreview: hoverFlag('hoverPixelToPreview'),
   };
 }
 
